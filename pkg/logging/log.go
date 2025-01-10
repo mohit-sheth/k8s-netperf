@@ -25,6 +25,11 @@ func init() {
 	defaultLog = new()
 }
 
+// SetError - Switch to ERROR level
+func SetError() {
+	SetLevel(defaultLog, logrus.ErrorLevel)
+}
+
 // SetDebug - Switch to DEBUG level
 func SetDebug() {
 	SetLevel(defaultLog, logrus.DebugLevel)
@@ -73,4 +78,14 @@ func Warn(args ...interface{}) {
 // Warnf - Warn Message
 func Warnf(format string, args ...interface{}) {
 	defaultLog.Warnf(format, args...)
+}
+
+// Fatal - Fatal Message
+func Fatal(args ...interface{}) {
+	defaultLog.Fatal(args...)
+}
+
+// Fatalf - Fatal Message
+func Fatalf(format string, args ...interface{}) {
+	defaultLog.Fatalf(format, args...)
 }
