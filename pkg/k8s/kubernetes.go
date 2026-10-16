@@ -2,31 +2,47 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
+	"time"
 
-	"github.com/jtaleric/k8s-netperf/pkg/config"
-	log "github.com/jtaleric/k8s-netperf/pkg/logging"
-	"github.com/jtaleric/k8s-netperf/pkg/metrics"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/config"
+	log "github.com/cloud-bulldozer/k8s-netperf/pkg/logging"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/metrics"
 	appsv1 "k8s.io/api/apps/v1"
-	apiv1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 )
 
 // DeploymentParams describes the deployment
+// Server pod can run multiple containers, each command in Commands will represent a container command
 type DeploymentParams struct {
-	HostNetwork     bool
-	Name            string
-	Namespace       string
-	Replicas        int32
-	Image           string
-	Labels          map[string]string
-	Command         []string
-	PodAffinity     apiv1.PodAffinity
-	PodAntiAffinity apiv1.PodAntiAffinity
-	NodeAffinity    apiv1.NodeAffinity
-	Port            int
+	HostNetwork        bool
+	Privileged         bool
+	Name               string
+	Namespace          string
+	Replicas           int32
+	Image              string
+	Labels             map[string]string
+	Commands           [][]string
+	PodAffinity        corev1.PodAffinity
+	PodAntiAffinity    corev1.PodAntiAffinity
+	NodeAffinity       corev1.NodeAffinity
+	Port               int
+	NetworkAnnotations map[string]string
+	ResourceRequests   corev1.ResourceList
 }
 
 // ServiceParams describes the service specific details
@@ -35,279 +51,1418 @@ type ServiceParams struct {
 	Namespace string
 	Labels    map[string]string
 	CtlPort   int32
-	DataPort  int32
+	DataPorts []int32
+}
+
+type PodNetworksData struct {
+	IPAddresses []string `json:"ip_addresses"`
+	MacAddress  string   `json:"mac_address"`
+	GatewayIPs  []string `json:"gateway_ips,omitempty"`
+	Role        string   `json:"role,omitempty"`
 }
 
 const sa string = "netperf"
+const namespace string = "netperf"
 
-// ServerCtlPort control port for the service
-const ServerCtlPort = 12865
+// NetperfServerCtlPort control port for the service
+const NetperfServerCtlPort = 12865
 
-// ServerDataPort data port for the service
-const ServerDataPort = 42424
+// IperfServerCtlPort control port for the service
+const IperfServerCtlPort = 22865
+
+// UperferverCtlPort control port for the service
+const UperfServerCtlPort = 30000
+const UperfLatServerCtlPort = 31000
+
+// NetperfServerDataPort data port for the service
+const NetperfServerDataPort = 42424
+
+// NetperfServerDataPort data port for the service
+const NetperfVmServerDataPort = 42524
+
+// IperfServerDataPort data port for the service
+const IperfServerDataPort = 43433
+
+// IperfServerDataPort data port for the service
+const IperfVmServerDataPort = 43533
+
+// UperfServerDataPort data port for the service
+const UperfServerDataPort = 30001
+const UperfLatServerDataPort = 31001
+
+// UperfServerDataPort data port for the service
+const UperfVmServerDataPort = 30101
+const UperfLatVmServerDataPort = 31101
 
 // Labels we will apply to k8s assets.
 const serverRole = "server"
-const clientRole = "client"
+const vmServerRole = "vm-server"
+const clientRole = "client-local"
 const clientAcrossRole = "client-across"
 const hostNetServerRole = "host-server"
 const hostNetClientRole = "host-client"
+const k8sNetperfImage = "quay.io/cloud-bulldozer/k8s-netperf:latest"
+const UdnName = "udn-primary-netperf"
+const CudnName = "cudn-secondary-netperf"
+const LocalnetCudnName = "cudn-localnet-netperf"
+const SriovNadName = "sriov-netperf"
+const SriovPolicyName = "sriov-netperf-policy"
+const sriovOperatorNamespace = "openshift-sriov-network-operator"
+const MacvlanNadName = "macvlan-netperf"
+const netperfNamespaceLabel = "k8s-netperf"
 
-// BuildSUT Build the k8s env to run network performance tests
-func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
-	// Check if nodes have the zone label to keep the netperf test
-	// in the same AZ/Zone versus across AZ/Zone
-	z, num_nodes, err := GetZone(client)
-	if err != nil {
-		log.Warn(err)
+// ValidateBridgeNetwork validates that the specified bridge namespace and NetworkAttachmentDefinition exist
+func ValidateBridgeNetwork(client *kubernetes.Clientset, dyn dynamic.Interface, bridgeNetwork, bridgeNamespace string) error {
+	if bridgeNetwork == "" {
+		return nil
 	}
-	log.Infof("Deploying in %s zone", z)
-	// Get node count
-	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker="})
-	if err != nil {
-		return err
-	}
-	ncount := len(nodes.Items)
-	log.Debugf("Number of nodes with role worker: %d", ncount)
 
-	if s.NodeLocal {
-		//  Create Netperf client on the same node as the server.
-		cdp := DeploymentParams{
-			Name:      "client",
-			Namespace: "netperf",
-			Replicas:  1,
-			Image:     "quay.io/jtaleric/netperf:beta",
-			Labels:    map[string]string{"role": clientRole},
-			Command:   []string{"/bin/bash", "-c", "sleep 10000000"},
-			Port:      ServerCtlPort,
-		}
-		if z != "" {
-			cdp.NodeAffinity = apiv1.NodeAffinity{
-				PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.PreferredSchedulingTerm{
-					{
-						Weight: 100,
-						Preference: apiv1.NodeSelectorTerm{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "topology.kubernetes.io/zone", Operator: apiv1.NodeSelectorOpIn, Values: []string{z}},
-							},
-						},
-					},
-				},
+	// Check if the namespace exists
+	_, err := client.CoreV1().Namespaces().Get(context.TODO(), bridgeNamespace, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("bridge namespace '%s' does not exist: %v", bridgeNamespace, err)
+	}
+
+	// Check if the NetworkAttachmentDefinition exists in the specified namespace
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.cni.cncf.io",
+		Version:  "v1",
+		Resource: "network-attachment-definitions",
+	}
+
+	_, err = dyn.Resource(gvr).Namespace(bridgeNamespace).Get(context.TODO(), bridgeNetwork, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("NetworkAttachmentDefinition '%s' does not exist in namespace '%s': %v", bridgeNetwork, bridgeNamespace, err)
+	}
+
+	log.Infof("✅ Bridge network validation passed: %s/%s", bridgeNamespace, bridgeNetwork)
+	return nil
+}
+
+// buildBridgeNetworkAnnotations creates the network annotations for Multus CNI bridge networks
+func buildBridgeNetworkAnnotations(bridgeNetwork, bridgeNamespace string) map[string]string {
+	annotations := make(map[string]string)
+	if bridgeNetwork != "" && bridgeNamespace != "" {
+		// Use cross-namespace format: namespace/network-name
+		networkRef := fmt.Sprintf("%s/%s", bridgeNamespace, bridgeNetwork)
+		annotations["k8s.v1.cni.cncf.io/networks"] = networkRef
+	}
+	return annotations
+}
+
+// buildCUdnNetworkAnnotations creates the network annotations for Multus CNI CUdn networks
+func buildCUdnNetworkAnnotations(cudn string) map[string]string {
+	annotations := make(map[string]string)
+	if cudn != "" {
+		annotations["k8s.v1.cni.cncf.io/networks"] = namespace + "/" + cudn
+		log.Infof("🌉 Configuring CUdn network: %s", namespace+"/"+cudn)
+	}
+	return annotations
+}
+
+// buildSriovNetworkAnnotations creates the network annotations for Multus CNI SR-IOV networks
+func buildSriovNetworkAnnotations() map[string]string {
+	annotations := make(map[string]string)
+	annotations["k8s.v1.cni.cncf.io/networks"] = namespace + "/" + SriovNadName
+	log.Infof("🌉 Configuring SR-IOV network: %s", namespace+"/"+SriovNadName)
+	return annotations
+}
+
+// buildMacvlanNetworkAnnotations creates the network annotations for Multus CNI MACVLAN networks
+func buildMacvlanNetworkAnnotations() map[string]string {
+	annotations := make(map[string]string)
+	annotations["k8s.v1.cni.cncf.io/networks"] = namespace + "/" + MacvlanNadName
+	log.Infof("🌉 Configuring MACVLAN network: %s", namespace+"/"+MacvlanNadName)
+	return annotations
+}
+
+// DeployNADMacvlan creates a NetworkAttachmentDefinition for MACVLAN in the netperf namespace
+func DeployNADMacvlan(dyn *dynamic.DynamicClient, master string) error {
+	log.Infof("Deploying MACVLAN NetworkAttachmentDefinition with master: %s", master)
+	nadMacvlan := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.cni.cncf.io/v1",
+			"kind":       "NetworkAttachmentDefinition",
+			"metadata": map[string]interface{}{
+				"name":      MacvlanNadName,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"config": fmt.Sprintf(`{"cniVersion": "0.3.1", "type": "macvlan", "master": "%s", "mode": "bridge", "ipam": {"type": "whereabouts", "range": "192.168.200.0/24"}}`, master),
+			},
+		},
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.cni.cncf.io",
+		Version:  "v1",
+		Resource: "network-attachment-definitions",
+	}
+	_, err := dyn.Resource(gvr).Namespace(namespace).Create(context.TODO(), nadMacvlan, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to create MACVLAN NAD: %v", err)
+	}
+	return nil
+}
+
+// ExtractMacvlanIp extracts the MACVLAN network IP address from pod network status annotation
+func ExtractMacvlanIp(pod corev1.Pod) (string, error) {
+	networkStatusJson := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+	if networkStatusJson == "" {
+		return "", fmt.Errorf("no network status annotation found on pod %s", pod.Name)
+	}
+
+	var networkStatuses []struct {
+		Name      string   `json:"name"`
+		Interface string   `json:"interface"`
+		IPs       []string `json:"ips"`
+		Default   bool     `json:"default,omitempty"`
+	}
+
+	err := json.Unmarshal([]byte(networkStatusJson), &networkStatuses)
+	if err != nil {
+		return "", fmt.Errorf("error unmarshalling network status: %v", err)
+	}
+
+	expectedNetworkName := fmt.Sprintf("%s/%s", namespace, MacvlanNadName)
+	for _, netStatus := range networkStatuses {
+		if netStatus.Name == expectedNetworkName && len(netStatus.IPs) > 0 {
+			for _, ip := range netStatus.IPs {
+				if strings.Contains(ip, ".") {
+					log.Debugf("Pod %s MACVLAN network IP: %s", pod.Name, ip)
+					return ip, nil
+				}
 			}
 		}
-		s.Client, err = deployDeployment(client, cdp)
-		if err != nil {
-			return err
-		}
-		s.ClientNodeInfo, _ = GetPodNodeInfo(client, cdp)
 	}
 
-	// Create netperf TCP service
-	spTCP := ServiceParams{
-		Name:      "netperf-service",
-		Namespace: "netperf",
-		Labels:    map[string]string{"role": serverRole},
-		CtlPort:   ServerCtlPort,
-		DataPort:  ServerDataPort,
-	}
-	s.Service, err = CreateService(spTCP, client)
-	if err != nil {
-		return fmt.Errorf("😥 Unable to create TCP netperf service")
-	}
-	cdpAcross := DeploymentParams{
-		Name:      "client-across",
-		Namespace: "netperf",
-		Replicas:  1,
-		Image:     "quay.io/jtaleric/netperf:beta",
-		Labels:    map[string]string{"role": clientAcrossRole},
-		Command:   []string{"/bin/bash", "-c", "sleep 10000000"},
-		Port:      ServerCtlPort,
-	}
-	cdpHostAcross := DeploymentParams{
-		Name:        "client-host",
-		Namespace:   "netperf",
-		Replicas:    1,
-		HostNetwork: true,
-		Image:       "quay.io/jtaleric/netperf:beta",
-		Labels:      map[string]string{"role": hostNetClientRole},
-		Command:     []string{"/bin/bash", "-c", "sleep 10000000"},
-		Port:        ServerCtlPort,
-	}
-	if z != "" {
-		if num_nodes > 1 {
-			cdpAcross.NodeAffinity = apiv1.NodeAffinity{
-				PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.PreferredSchedulingTerm{
-					{
-						Weight: 100,
-						Preference: apiv1.NodeSelectorTerm{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "topology.kubernetes.io/zone", Operator: apiv1.NodeSelectorOpIn, Values: []string{z}},
-							},
-						},
-					},
-				},
-				RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
-					NodeSelectorTerms: []apiv1.NodeSelectorTerm{
-						{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "node-role.kubernetes.io/worker", Operator: apiv1.NodeSelectorOpIn, Values: []string{""}},
-							},
-						},
-					},
-				},
-			}
+	return "", fmt.Errorf("MACVLAN network IP not found for %s on pod %s", expectedNetworkName, pod.Name)
+}
+
+// BuildInfra will create the infra for the SUT
+func BuildInfra(client *kubernetes.Clientset, udn bool) error {
+	_, err := client.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
+	if err == nil {
+		log.Infof("♻️ Namespace already exists, reusing it")
+	} else {
+		log.Infof("🔨 Creating namespace: %s", namespace)
+		if udn {
+			_, err = client.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace,
+				Labels: map[string]string{"k8s.ovn.org/primary-user-defined-network": ""}}}, metav1.CreateOptions{})
 		} else {
-			cdpAcross.NodeAffinity = apiv1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
-					NodeSelectorTerms: []apiv1.NodeSelectorTerm{
-						{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "node-role.kubernetes.io/worker", Operator: apiv1.NodeSelectorOpIn, Values: []string{""}},
-							},
-						},
-					},
-				},
-			}
-		}
-	}
-	if ncount > 1 {
-		if s.HostNetwork {
-			s.ClientHost, err = deployDeployment(client, cdpHostAcross)
+			_, err = client.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace,
+				Labels: map[string]string{namespace: netperfNamespaceLabel}}}, metav1.CreateOptions{})
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("😥 Unable to create namespace: %v", err)
 		}
-		s.ClientAcross, err = deployDeployment(client, cdpAcross)
+	}
+	_, err = client.CoreV1().ServiceAccounts(namespace).Get(context.TODO(), sa, metav1.GetOptions{})
+	if err == nil {
+		log.Infof("♻️ Service account already exists, reusing it")
+	} else {
+		log.Infof("🔨 Creating service account: %s", sa)
+		_, err = client.CoreV1().ServiceAccounts(namespace).Create(context.TODO(), &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: sa}}, metav1.CreateOptions{})
 		if err != nil {
-			return err
+			return fmt.Errorf("😥 Unable to create service account: %v", err)
 		}
 	}
-	sdpHost := DeploymentParams{
-		Name:        "server-host",
-		Namespace:   "netperf",
-		Replicas:    1,
-		HostNetwork: true,
-		Image:       "quay.io/jtaleric/netperf:beta",
-		Labels:      map[string]string{"role": hostNetServerRole},
-		Command:     []string{"/bin/bash", "-c", fmt.Sprintf("netserver; sleep 10000000")},
-		Port:        ServerCtlPort,
+	rBinding := &v1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sa,
+			Namespace: namespace,
+		},
+		RoleRef: v1.RoleRef{
+			Kind: "ClusterRole",
+			Name: "system:openshift:scc:hostnetwork",
+		},
+		Subjects: []v1.Subject{
+			{
+				Namespace: namespace,
+				Name:      sa,
+				Kind:      "ServiceAccount",
+			},
+		},
 	}
-	// Start netperf server
-	sdp := DeploymentParams{
-		Name:      "server",
-		Namespace: "netperf",
-		Replicas:  1,
-		Image:     "quay.io/jtaleric/netperf:beta",
-		Labels:    map[string]string{"role": serverRole},
-		Command:   []string{"/bin/bash", "-c", fmt.Sprintf("netserver; sleep 10000000")},
-		Port:      ServerCtlPort,
-	}
-	if z != "" {
-		affinity := apiv1.NodeAffinity{}
-		if num_nodes > 1 {
-			affinity = apiv1.NodeAffinity{
-				PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.PreferredSchedulingTerm{
-					{
-						Weight: 100,
-						Preference: apiv1.NodeSelectorTerm{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "topology.kubernetes.io/zone", Operator: apiv1.NodeSelectorOpIn, Values: []string{z}},
-							},
-						},
-					},
-				},
-				RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
-					NodeSelectorTerms: []apiv1.NodeSelectorTerm{
-						{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "node-role.kubernetes.io/worker", Operator: apiv1.NodeSelectorOpIn, Values: []string{""}},
-							},
-						},
-					},
-				},
-			}
-		} else {
-			affinity = apiv1.NodeAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
-					NodeSelectorTerms: []apiv1.NodeSelectorTerm{
-						{
-							MatchExpressions: []apiv1.NodeSelectorRequirement{
-								{Key: "node-role.kubernetes.io/worker", Operator: apiv1.NodeSelectorOpIn, Values: []string{""}},
-							},
-						},
-					},
-				},
-			}
+	_, err = client.RbacV1().RoleBindings(namespace).Get(context.TODO(), sa, metav1.GetOptions{})
+	if err == nil {
+		log.Infof("♻️ Role binding already exists, reusing it")
+	} else {
+		_, err = client.RbacV1().RoleBindings(namespace).Create(context.TODO(), rBinding, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("😥 Unable to create role-binding: %v", err)
 		}
-		sdp.NodeAffinity = affinity
-		sdpHost.NodeAffinity = affinity
 	}
-	if ncount > 1 {
-		antiAffinity := apiv1.PodAntiAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.WeightedPodAffinityTerm{
-				{
-					Weight: 100,
-					PodAffinityTerm: apiv1.PodAffinityTerm{
-						LabelSelector: &metav1.LabelSelector{
-							MatchExpressions: []metav1.LabelSelectorRequirement{
-								{Key: "role", Operator: metav1.LabelSelectorOpIn, Values: []string{clientAcrossRole}},
-							},
-						},
-						TopologyKey: "kubernetes.io/hostname",
+	return nil
+}
+
+// Create a User Defined Network for the tests
+func DeployL2Udn(dynamicClient *dynamic.DynamicClient) error {
+	log.Infof("Deploying L2 Primary UDN in the NS : %s", namespace)
+	udn := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.ovn.org/v1",
+			"kind":       "UserDefinedNetwork",
+			"metadata": map[string]interface{}{
+				"name":      UdnName,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"topology": "Layer2",
+				"layer2": map[string]interface{}{
+					"role":    "Primary",
+					"subnets": []string{"10.0.0.0/24"},
+					"ipam": map[string]interface{}{
+						"lifecycle": "Persistent",
 					},
 				},
 			},
-		}
-		sdp.PodAntiAffinity = antiAffinity
-		antiAffinity = apiv1.PodAntiAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []apiv1.WeightedPodAffinityTerm{
-				{
-					Weight: 100,
-					PodAffinityTerm: apiv1.PodAffinityTerm{
-						LabelSelector: &metav1.LabelSelector{
-							MatchExpressions: []metav1.LabelSelectorRequirement{
-								{Key: "role", Operator: metav1.LabelSelectorOpIn, Values: []string{hostNetClientRole}},
-							},
-						},
-						TopologyKey: "kubernetes.io/hostname",
-					},
-				},
-			},
-		}
-		sdpHost.PodAntiAffinity = antiAffinity
+		},
 	}
-	if s.HostNetwork {
-		s.ServerHost, err = deployDeployment(client, sdpHost)
-		if err != nil {
-			return err
-		}
-	}
-	s.Server, err = deployDeployment(client, sdp)
 
-	s.ServerNodeInfo, _ = GetPodNodeInfo(client, sdp)
-	if !s.NodeLocal {
-		s.ClientNodeInfo, _ = GetPodNodeInfo(client, cdpAcross)
+	// Specify the GVR for UDN
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.ovn.org",
+		Version:  "v1",
+		Resource: "userdefinednetworks",
 	}
+	_, err := dynamicClient.Resource(gvr).Namespace(namespace).Create(context.TODO(), udn, metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
+// Create a User Defined Network for the tests
+func DeployL3Udn(dynamicClient *dynamic.DynamicClient) error {
+	log.Infof("Deploying L3 Primary UDN in the NS : %s", namespace)
+	udn := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.ovn.org/v1",
+			"kind":       "UserDefinedNetwork",
+			"metadata": map[string]interface{}{
+				"name":      UdnName,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"topology": "Layer3",
+				"layer3": map[string]interface{}{
+					"role": "Primary",
+					"subnets": []interface{}{
+						map[string]interface{}{
+							"cidr": "10.0.0.0/16",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Specify the GVR for UDN
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.ovn.org",
+		Version:  "v1",
+		Resource: "userdefinednetworks",
+	}
+	_, err := dynamicClient.Resource(gvr).Namespace(namespace).Create(context.TODO(), udn, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Create a Cluster User Defined Network as a secondary network
+func DeployCUDN(dynamicClient *dynamic.DynamicClient, cudn string) error {
+	log.Infof("Deploying CUDN, %s, in the NS : %s", cudn, namespace)
+	if len(cudn) == 0 {
+		return fmt.Errorf("cudn cannot be empty")
+	}
+	cudn = strings.ToLower(cudn)
+	topology := strings.ToUpper(string(cudn[0])) + cudn[1:]
+	cudnObj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.ovn.org/v1",
+			"kind":       "ClusterUserDefinedNetwork",
+			"metadata": map[string]interface{}{
+				"name":      CudnName,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"namespaceSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						namespace: netperfNamespaceLabel,
+					},
+				},
+				"network": map[string]interface{}{
+					"topology": topology,
+					cudn: func() map[string]interface{} {
+						cudnMap := map[string]interface{}{
+							"role": "Secondary",
+						}
+						switch topology {
+						case "Layer3":
+							cudnMap["subnets"] = []interface{}{
+								map[string]interface{}{
+									"cidr": "20.0.0.0/16",
+								},
+							}
+						case "Layer2":
+							cudnMap["ipam"] = map[string]interface{}{
+								"lifecycle": "Persistent",
+							}
+							cudnMap["subnets"] = []string{"20.0.0.0/16"}
+						}
+						return cudnMap
+					}(),
+				},
+			},
+		},
+	}
+
+	// Specify the GVR for CUDN (cluster-scoped resource)
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.ovn.org",
+		Version:  "v1",
+		Resource: "clusteruserdefinednetworks",
+	}
+	_, err := dynamicClient.Resource(gvr).Create(context.TODO(), cudnObj, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeployLocalnetCUDN creates a ClusterUserDefinedNetwork with topology: Localnet.
+func DeployLocalnetCUDN(dynamicClient *dynamic.DynamicClient, externalNetworkName string) error {
+	log.Infof("Deploying localnet CUDN for external network: %s", externalNetworkName)
+	if externalNetworkName == "" {
+		return fmt.Errorf("externalNetworkName cannot be empty")
+	}
+	cudnObj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.ovn.org/v1",
+			"kind":       "ClusterUserDefinedNetwork",
+			"metadata": map[string]interface{}{
+				"name": LocalnetCudnName,
+			},
+			"spec": map[string]interface{}{
+				"namespaceSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						namespace: netperfNamespaceLabel,
+					},
+				},
+				"network": map[string]interface{}{
+					"topology": "Localnet",
+					"localnet": map[string]interface{}{
+						"role":                "Secondary",
+						"physicalNetworkName": externalNetworkName,
+						"ipam": map[string]interface{}{
+							"mode": "Disabled",
+						},
+					},
+				},
+			},
+		},
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.ovn.org",
+		Version:  "v1",
+		Resource: "clusteruserdefinednetworks",
+	}
+	_, err := dynamicClient.Resource(gvr).Create(context.TODO(), cudnObj, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to create localnet CUDN: %v", err)
+	}
+	return nil
+}
+
+// Create a NetworkAttachcmentDefinition object for a bridge connection
+func DeployNADBridge(dyn *dynamic.DynamicClient, bridgeName string) error {
+	nadBridge := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.cni.cncf.io/v1",
+			"kind":       "NetworkAttachmentDefinition",
+			"metadata": map[string]interface{}{
+				"name":      "br-netperf",
+				"namespace": namespace,
+				"annotations": map[string]interface{}{
+					"k8s.v1.cni.cncf.io/resourceName": "bridge.network.kubevirt.io/" + bridgeName,
+				},
+			},
+			"spec": map[string]interface{}{
+				"config": `{"cniVersion": "0.3.1", "type": "bridge", "name": "br-netperf", "bridge": "` + bridgeName + `"}`,
+			},
+		},
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.cni.cncf.io",
+		Version:  "v1",
+		Resource: "network-attachment-definitions",
+	}
+	_, err := dyn.Resource(gvr).Namespace(namespace).Create(context.TODO(), nadBridge, metav1.CreateOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeploySriovOperatorConfig applies the SriovOperatorConfig with disableDrain to avoid node drain/reboot
+func DeploySriovOperatorConfig(dyn *dynamic.DynamicClient, nodeRole string) error {
+	log.Infof("Applying SriovOperatorConfig with disableDrain: true")
+	gvr := schema.GroupVersionResource{
+		Group:    "sriovnetwork.openshift.io",
+		Version:  "v1",
+		Resource: "sriovoperatorconfigs",
+	}
+	existing, err := dyn.Resource(gvr).Namespace(sriovOperatorNamespace).Get(context.TODO(), "default", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to get SriovOperatorConfig: %v", err)
+	}
+	spec, _ := existing.Object["spec"].(map[string]interface{})
+	if spec == nil {
+		spec = make(map[string]interface{})
+	}
+	spec["configDaemonNodeSelector"] = map[string]interface{}{
+		"node-role.kubernetes.io/" + nodeRole: "",
+	}
+	spec["disableDrain"] = true
+	existing.Object["spec"] = spec
+	_, err = dyn.Resource(gvr).Namespace(sriovOperatorNamespace).Update(context.TODO(), existing, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to update SriovOperatorConfig: %v", err)
+	}
+	return nil
+}
+
+// DeploySriovPolicy creates a SriovNetworkNodePolicy CR to carve VFs from a PF
+func DeploySriovPolicy(dyn *dynamic.DynamicClient, pfName string, nodeRole string, vm bool) error {
+	deviceType := "netdevice"
+	if vm {
+		deviceType = "vfio-pci"
+	}
+	log.Infof("Deploying SriovNetworkNodePolicy for PF: %s (deviceType: %s)", pfName, deviceType)
+	policy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "sriovnetwork.openshift.io/v1",
+			"kind":       "SriovNetworkNodePolicy",
+			"metadata": map[string]interface{}{
+				"name":      SriovPolicyName,
+				"namespace": sriovOperatorNamespace,
+			},
+			"spec": map[string]interface{}{
+				"resourceName": pfName,
+				"deviceType":   deviceType,
+				"numVfs":       2,
+				"nicSelector": map[string]interface{}{
+					"pfNames": []string{pfName},
+				},
+				"nodeSelector": map[string]interface{}{
+					"node-role.kubernetes.io/" + nodeRole: "",
+				},
+			},
+		},
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "sriovnetwork.openshift.io",
+		Version:  "v1",
+		Resource: "sriovnetworknodepolicies",
+	}
+	_, err := dyn.Resource(gvr).Namespace(sriovOperatorNamespace).Create(context.TODO(), policy, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to create SriovNetworkNodePolicy: %v", err)
+	}
+	return nil
+}
+
+// DeploySriovNetwork creates a SriovNetwork CR which auto-generates a NAD in the netperf namespace
+func DeploySriovNetwork(dyn *dynamic.DynamicClient, resourceName string) error {
+	log.Infof("Deploying SriovNetwork with resourceName: %s", resourceName)
+	sriovNet := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "sriovnetwork.openshift.io/v1",
+			"kind":       "SriovNetwork",
+			"metadata": map[string]interface{}{
+				"name":      SriovNadName,
+				"namespace": sriovOperatorNamespace,
+			},
+			"spec": map[string]interface{}{
+				"networkNamespace": namespace,
+				"resourceName":     resourceName,
+				"ipam":             `{"type": "whereabouts", "range": "192.168.100.0/24"}`,
+			},
+		},
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "sriovnetwork.openshift.io",
+		Version:  "v1",
+		Resource: "sriovnetworks",
+	}
+	_, err := dyn.Resource(gvr).Namespace(sriovOperatorNamespace).Create(context.TODO(), sriovNet, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to create SriovNetwork: %v", err)
+	}
+	return nil
+}
+
+// WaitForSriovNad polls for the SR-IOV NAD to be created in the netperf namespace
+func WaitForSriovNad(dyn *dynamic.DynamicClient) error {
+	log.Infof("Waiting for SR-IOV NetworkAttachmentDefinition %s in namespace %s...", SriovNadName, namespace)
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.cni.cncf.io",
+		Version:  "v1",
+		Resource: "network-attachment-definitions",
+	}
+	// Poll every 5 seconds for up to 120 seconds
+	for i := 0; i < 24; i++ {
+		_, err := dyn.Resource(gvr).Namespace(namespace).Get(context.TODO(), SriovNadName, metav1.GetOptions{})
+		if err == nil {
+			log.Infof("SR-IOV NetworkAttachmentDefinition %s is ready", SriovNadName)
+			return nil
+		}
+		log.Debugf("NAD not yet available, retrying in 5s... (%d/24)", i+1)
+		time.Sleep(5 * time.Second)
+	}
+	return fmt.Errorf("timed out waiting for SR-IOV NAD %s in namespace %s", SriovNadName, namespace)
+}
+
+// DestroySriovResources cleans up the SriovNetwork and SriovNetworkNodePolicy CRs
+func DestroySriovResources(dyn *dynamic.DynamicClient) error {
+	log.Info("Cleaning up SR-IOV resources")
+	deletePolicy := metav1.DeletePropagationForeground
+	opts := metav1.DeleteOptions{PropagationPolicy: &deletePolicy}
+
+	gvrNet := schema.GroupVersionResource{
+		Group:    "sriovnetwork.openshift.io",
+		Version:  "v1",
+		Resource: "sriovnetworks",
+	}
+	err := dyn.Resource(gvrNet).Namespace(sriovOperatorNamespace).Delete(context.TODO(), SriovNadName, opts)
+	if err != nil {
+		log.Warnf("Failed to delete SriovNetwork: %v", err)
+	}
+
+	gvrPolicy := schema.GroupVersionResource{
+		Group:    "sriovnetwork.openshift.io",
+		Version:  "v1",
+		Resource: "sriovnetworknodepolicies",
+	}
+	err = dyn.Resource(gvrPolicy).Namespace(sriovOperatorNamespace).Delete(context.TODO(), SriovPolicyName, opts)
+	if err != nil {
+		log.Warnf("Failed to delete SriovNetworkNodePolicy: %v", err)
+	}
+	return nil
+}
+
+// BuildSUT Build the k8s env to run network performance tests
+func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
+	var netperfDataPorts []int32
+	var netperfVmDataPorts []int32
+	var err error
+
+	// Build SR-IOV resource requests if needed
+	var sriovResources corev1.ResourceList
+	if s.SriovNetwork != "" {
+		sriovResources = corev1.ResourceList{
+			corev1.ResourceName("openshift.io/" + s.SriovNetwork): resource.MustParse("1"),
+		}
+	}
+
+	// Schedule pods to nodes with role worker=, but not nodes with infra= and workload=
+	workerNodeSelectorExpression := &corev1.NodeSelector{
+		NodeSelectorTerms: []corev1.NodeSelectorTerm{
+			{
+				MatchExpressions: []corev1.NodeSelectorRequirement{
+					{Key: "node-role.kubernetes.io/worker", Operator: corev1.NodeSelectorOpIn, Values: []string{""}},
+					{Key: "node-role.kubernetes.io/infra", Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
+					{Key: "node-role.kubernetes.io/workload", Operator: corev1.NodeSelectorOpNotIn, Values: []string{""}},
+				},
+			},
+		},
+	}
+
+	if s.ExternalServer {
+		networkAnnotations := make(map[string]string)
+		//  Create Netperf client on any worker node. No service or server pod required in this scenario.
+		if s.BridgeNetwork != "" {
+			networkAnnotations = buildBridgeNetworkAnnotations(s.BridgeNetwork, s.BridgeNamespace)
+		} else if s.Cudn {
+			networkAnnotations = buildCUdnNetworkAnnotations(CudnName)
+		} else if s.SriovNetwork != "" {
+			networkAnnotations = buildSriovNetworkAnnotations()
+		} else if s.MacvlanNetwork != "" {
+			networkAnnotations = buildMacvlanNetworkAnnotations()
+		}
+		cdp := DeploymentParams{
+			Name:               "client",
+			Namespace:          "netperf",
+			Replicas:           1,
+			Image:              k8sNetperfImage,
+			Labels:             map[string]string{"role": clientRole},
+			Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
+			Port:               NetperfServerCtlPort,
+			NetworkAnnotations: networkAnnotations,
+			ResourceRequests:   sriovResources,
+			Privileged:         s.Privileged,
+		}
+
+		cdp.NodeAffinity = corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: workerNodeSelectorExpression,
+		}
+
+		s.Client, err = deployDeployment(client, cdp)
+		if err != nil {
+			return err
+		}
+
+		s.ClientNodeInfo, err = GetPodNodeInfo(client, labels.Set(cdp.Labels).String())
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	// Check if nodes have the zone label to keep the netperf test
+	// in the same AZ/Zone versus across AZ/Zone
+	z, zones, err := GetZone(client)
+	if err != nil {
+		log.Warn(err)
+	}
+	numNodes := zones[z]
+	if numNodes > 1 {
+		log.Infof("Deploying in %s zone", z)
+	} else {
+		log.Warn("⚠️  Single node per zone and/or no zone labels")
+	}
+	if len(zones) < 2 && s.AcrossAZ {
+		return fmt.Errorf("unable to run AcrossAZ since there is < 2 zones")
+	}
+	acrossZone := ""
+	if s.AcrossAZ {
+		for az := range zones {
+			if z != az {
+				acrossZone = az
+				log.Infof("Running AcrossAZ tests -- The other Zone is %s", acrossZone)
+				break
+			}
+		}
+	}
+
+	// Get node count
+	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker=,node-role.kubernetes.io/infra!="})
+	if err != nil {
+		return err
+	}
+	ncount := len(nodes.Items)
+	log.Debugf("Number of nodes with role worker: %d", ncount)
+	if !s.NodeLocal && ncount < 2 {
+		return fmt.Errorf("not enough nodes with label worker= to execute test (current number of nodes: %d)", ncount)
+	}
+
+	clientRoleAffinity := []corev1.PodAffinityTerm{
+		{
+			LabelSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "role", Operator: metav1.LabelSelectorOpIn, Values: []string{clientRole}},
+				},
+			},
+			TopologyKey: "kubernetes.io/hostname",
+		},
+	}
+
+	if s.NodeLocal {
+		//  Create Netperf client on the same node as the server.
+		networkAnnotations := make(map[string]string)
+		//  Create Netperf client on any worker node. No service or server pod required in this scenario.
+		if s.BridgeNetwork != "" {
+			networkAnnotations = buildBridgeNetworkAnnotations(s.BridgeNetwork, s.BridgeNamespace)
+		} else if s.Cudn {
+			networkAnnotations = buildCUdnNetworkAnnotations(CudnName)
+		} else if s.SriovNetwork != "" {
+			networkAnnotations = buildSriovNetworkAnnotations()
+		} else if s.MacvlanNetwork != "" {
+			networkAnnotations = buildMacvlanNetworkAnnotations()
+		}
+		cdp := DeploymentParams{
+			Name:               "client",
+			Namespace:          "netperf",
+			Replicas:           1,
+			HostNetwork:        s.HostNetwork,
+			Image:              k8sNetperfImage,
+			Labels:             map[string]string{"role": clientRole},
+			Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
+			Port:               NetperfServerCtlPort,
+			NetworkAnnotations: networkAnnotations,
+			ResourceRequests:   sriovResources,
+			Privileged:         s.Privileged,
+		}
+		if z != "" && numNodes > 1 {
+			cdp.NodeAffinity = corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: zoneNodeSelectorExpression(*client, z, "client"),
+			}
+		}
+
+		cdp.NodeAffinity = corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: workerNodeSelectorExpression,
+		}
+		if s.Pod {
+			s.Client, err = deployDeployment(client, cdp)
+			if err != nil {
+				return err
+			}
+		}
+		s.ClientNodeInfo, err = GetPodNodeInfo(client, labels.Set(cdp.Labels).String())
+		if err != nil {
+			return err
+		}
+	}
+
+	// Helper function to check if a driver is requested
+	containsDriver := func(drivers []string, driver string) bool {
+		for _, d := range drivers {
+			if d == driver {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Debug: Print requested drivers in BuildSUT
+	log.Debugf("🔥 BuildSUT: RequestedDrivers=%v, len=%d", s.RequestedDrivers, len(s.RequestedDrivers))
+
+	// Create services only for requested drivers
+	if containsDriver(s.RequestedDrivers, "iperf3") {
+		if s.Pod {
+			// Create iperf service
+			iperfSVC := ServiceParams{
+				Name:      "iperf-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": serverRole},
+				CtlPort:   IperfServerCtlPort,
+				DataPorts: []int32{IperfServerDataPort},
+			}
+			s.IperfService, err = CreateService(iperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create iperf service: %v", err)
+			}
+		}
+		if s.VM {
+			// Create iperf VM service
+			iperfSVC := ServiceParams{
+				Name:      "iperf-vm-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": vmServerRole},
+				CtlPort:   IperfServerCtlPort,
+				DataPorts: []int32{IperfVmServerDataPort},
+			}
+			s.IperfVmService, err = CreateService(iperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create iperf service: %v", err)
+			}
+		}
+	}
+
+	if containsDriver(s.RequestedDrivers, "uperf") {
+		if s.Pod {
+			// Create uperf service
+			uperfSVC := ServiceParams{
+				Name:      "uperf-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": serverRole},
+				CtlPort:   UperfServerCtlPort,
+				DataPorts: []int32{UperfServerDataPort},
+			}
+			s.UperfService, err = CreateService(uperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create uperf service: %v", err)
+			}
+			// Create uperf-histogram service
+			uperfLatSVC := ServiceParams{
+				Name:      "uperf-histogram-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": serverRole},
+				CtlPort:   UperfLatServerCtlPort,
+				DataPorts: []int32{UperfLatServerDataPort},
+			}
+			s.UperfLatService, err = CreateService(uperfLatSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create uperf-histogram service: %v", err)
+			}
+		}
+		if s.VM {
+			uperfSVC := ServiceParams{
+				Name:      "uperf-vm-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": vmServerRole},
+				CtlPort:   UperfServerCtlPort,
+				DataPorts: []int32{UperfVmServerDataPort},
+			}
+			s.UperfVmService, err = CreateService(uperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create uperf service: %v", err)
+			}
+			//
+			uperfLatSVC := ServiceParams{
+				Name:      "uperf-vm-histogram-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": vmServerRole},
+				CtlPort:   UperfLatServerCtlPort,
+				DataPorts: []int32{UperfLatVmServerDataPort},
+			}
+			s.UperfLatVmService, err = CreateService(uperfLatSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create uperf-histogram service: %v", err)
+			}
+		}
+	}
+
+	if containsDriver(s.RequestedDrivers, "netperf") {
+		if s.Pod {
+			// Create netperf service
+			for i := 0; i < 16; i++ {
+				netperfDataPorts = append(netperfDataPorts, NetperfServerDataPort+int32(i))
+			}
+			netperfSVC := ServiceParams{
+				Name:      "netperf-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": serverRole},
+				CtlPort:   NetperfServerCtlPort,
+				DataPorts: netperfDataPorts,
+			}
+			s.NetperfService, err = CreateService(netperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create netperf service: %v", err)
+			}
+		}
+		if s.VM {
+			// Create netperf VM service
+			for i := 0; i < 16; i++ {
+				netperfVmDataPorts = append(netperfVmDataPorts, NetperfServerDataPort+int32(i))
+			}
+			netperfSVC := ServiceParams{
+				Name:      "netperf-vm-service",
+				Namespace: "netperf",
+				Labels:    map[string]string{"role": vmServerRole},
+				CtlPort:   NetperfServerCtlPort,
+				DataPorts: netperfVmDataPorts,
+			}
+			s.NetperfVmService, err = CreateService(netperfSVC, client)
+			if err != nil {
+				return fmt.Errorf("😥 Unable to create netperf service: %v", err)
+			}
+		}
+	}
+	// Note: ib_write_bw doesn't need a service since it uses direct pod IP communication
+
+	networkAnnotations := make(map[string]string)
+	if s.BridgeNetwork != "" {
+		networkAnnotations = buildBridgeNetworkAnnotations(s.BridgeNetwork, s.BridgeNamespace)
+	} else if s.Cudn {
+		networkAnnotations = buildCUdnNetworkAnnotations(CudnName)
+	} else if s.SriovNetwork != "" {
+		networkAnnotations = buildSriovNetworkAnnotations()
+	} else if s.MacvlanNetwork != "" {
+		networkAnnotations = buildMacvlanNetworkAnnotations()
+	}
+	cdpAcross := DeploymentParams{
+		Name:               "client-across",
+		Namespace:          "netperf",
+		Replicas:           1,
+		Image:              k8sNetperfImage,
+		Labels:             map[string]string{"role": clientAcrossRole},
+		Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
+		Port:               NetperfServerCtlPort,
+		NetworkAnnotations: networkAnnotations,
+		ResourceRequests:   sriovResources,
+		Privileged:         s.Privileged,
+	}
+	cdpAcross.PodAntiAffinity = corev1.PodAntiAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: clientRoleAffinity,
+	}
+
+	cdpHostAcross := DeploymentParams{
+		Name:        "client-host",
+		Namespace:   "netperf",
+		Replicas:    1,
+		HostNetwork: true,
+		Image:       k8sNetperfImage,
+		Labels:      map[string]string{"role": hostNetClientRole},
+		Commands:    [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
+		Port:        NetperfServerCtlPort,
+		Privileged:  s.Privileged,
+	}
+	if z != "" {
+		if numNodes > 1 {
+			cdpAcross.NodeAffinity = corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: zoneNodeSelectorExpression(*client, z, "client"),
+				RequiredDuringSchedulingIgnoredDuringExecution:  workerNodeSelectorExpression,
+			}
+		} else {
+			cdpAcross.NodeAffinity = corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: workerNodeSelectorExpression,
+			}
+		}
+	} else {
+		affinity := corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+				{
+					Weight: 100,
+					Preference: corev1.NodeSelectorTerm{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{Key: "netperf", Operator: corev1.NodeSelectorOpIn, Values: []string{"client"}},
+						},
+					},
+				},
+			},
+		}
+		cdpAcross.NodeAffinity = affinity
+		cdpHostAcross.NodeAffinity = affinity
+	}
+
+	if ncount > 1 {
+		if s.HostNetwork {
+			cdpHostAcross.NodeAffinity = corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: zoneNodeSelectorExpression(*client, z, "client"),
+				RequiredDuringSchedulingIgnoredDuringExecution:  workerNodeSelectorExpression,
+			}
+			cdpHostAcross.PodAntiAffinity = corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: clientRoleAffinity,
+			}
+			if s.Pod {
+				s.ClientHost, err = deployDeployment(client, cdpHostAcross)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// If HostNetworkOnly mode, get client node info from host network pods
+		if s.HostNetworkOnly && s.HostNetwork {
+			s.ClientNodeInfo, err = GetPodNodeInfo(client, labels.Set(cdpHostAcross.Labels).String())
+			if err != nil {
+				return err
+			}
+		}
+
+		// Only create regular client pods if not in HostNetworkOnly mode
+		if !s.HostNetworkOnly {
+			if s.Pod {
+				s.ClientAcross, err = deployDeployment(client, cdpAcross)
+				if err != nil {
+					return err
+				}
+			}
+			if s.VM {
+				err = launchClientVM(s, clientAcrossRole, &cdpAcross.PodAntiAffinity, &cdpAcross.NodeAffinity)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+	}
+
+	// Use separate containers for servers
+	var dpCommands [][]string
+
+	// Debug: Print requested drivers for server commands
+	log.Debugf("🔥 Server Commands: RequestedDrivers=%v, len=%d", s.RequestedDrivers, len(s.RequestedDrivers))
+
+	// Add server commands only for requested drivers
+	if containsDriver(s.RequestedDrivers, "netperf") {
+		dpCommands = append(dpCommands, []string{"/bin/bash", "-c", "netserver && sleep 10000000"})
+	}
+	if containsDriver(s.RequestedDrivers, "iperf3") {
+		dpCommands = append(dpCommands, []string{"/bin/bash", "-c", fmt.Sprintf("iperf3 -s -p %d && sleep 10000000", IperfServerCtlPort)})
+	}
+	if containsDriver(s.RequestedDrivers, "uperf") {
+		// Check if any config uses TCP_STREAM_LAT profile
+		needsHistogram := false
+		for _, cfg := range s.Configs {
+			if cfg.Profile == "TCP_STREAM_LAT" {
+				needsHistogram = true
+				break
+			}
+		}
+
+		// Start uperf_histogram server only if TCP_STREAM_LAT is used
+		if needsHistogram {
+			dpCommands = append(dpCommands, []string{"/bin/bash", "-c", fmt.Sprintf("/opt/uperf-histogram/bin/uperf -s -v -P %d && sleep 10000000", UperfLatServerCtlPort)})
+		}
+
+		// Always start regular uperf server for other profiles
+		dpCommands = append(dpCommands, []string{"/bin/bash", "-c", fmt.Sprintf("uperf -s -v -P %d && sleep 10000000", UperfServerCtlPort)})
+	}
+	if containsDriver(s.RequestedDrivers, "ib_write_bw") {
+		// Parse nic:gid parameters for ib_write_bw server
+		parts := strings.Split(s.IbWriteBwParams, ":")
+		if len(parts) != 2 {
+			log.Fatalf("Invalid ib-write-bw server config: %s", s.IbWriteBwParams)
+		}
+		device := strings.TrimSpace(parts[0])
+		gid := strings.TrimSpace(parts[1])
+		// perftest requires server and client to use identical -D values
+		ibDuration := 10
+		for _, cfg := range s.Configs {
+			if strings.EqualFold(cfg.Profile, "UDP_STREAM") {
+				ibDuration = cfg.Duration
+				break
+			}
+		}
+		ibWriteCmd := fmt.Sprintf("stdbuf -oL -eL ib_write_bw -d %s -x %s -F -D %d", device, gid, ibDuration)
+		ibWriteCmd = fmt.Sprintf("while true; do %s; sleep 1; done", ibWriteCmd)
+		dpCommands = append(dpCommands, []string{"/bin/bash", "-c", ibWriteCmd})
+	}
+
+	// Debug: Print final dpCommands
+	log.Debugf("🔥 Final dpCommands count: %d", len(dpCommands))
+	for i, cmd := range dpCommands {
+		log.Debugf("🔥 dpCommand[%d]: %v", i, cmd)
+	}
+
+	sdpHost := DeploymentParams{
+		Name:        "server-host",
+		Namespace:   "netperf",
+		Replicas:    1,
+		HostNetwork: true,
+		Image:       k8sNetperfImage,
+		Labels:      map[string]string{"role": hostNetServerRole},
+		Commands:    dpCommands,
+		Port:        NetperfServerCtlPort,
+		Privileged:  s.Privileged,
+	}
+	// Start netperf server
+	sdp := DeploymentParams{
+		Name:               "server",
+		Namespace:          "netperf",
+		Replicas:           1,
+		Image:              k8sNetperfImage,
+		Labels:             map[string]string{"role": serverRole},
+		Commands:           dpCommands,
+		Port:               NetperfServerCtlPort,
+		NetworkAnnotations: networkAnnotations,
+		ResourceRequests:   sriovResources,
+		Privileged:         s.Privileged,
+	}
+	if s.NodeLocal {
+		sdp.PodAffinity = corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: clientRoleAffinity,
+		}
+		// For local mode with hostNet, use host network on the regular server
+		if s.HostNetwork {
+			sdp.HostNetwork = true
+		}
+	}
+	if z != "" {
+		var affinity corev1.NodeAffinity
+		if numNodes > 1 {
+			nodeZone := zoneNodeSelectorExpression(*client, z, "server")
+			if s.AcrossAZ {
+				nodeZone = zoneNodeSelectorExpression(*client, acrossZone, "server")
+			}
+			affinity = corev1.NodeAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: nodeZone,
+				RequiredDuringSchedulingIgnoredDuringExecution:  workerNodeSelectorExpression,
+			}
+		} else {
+			affinity = corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: workerNodeSelectorExpression,
+			}
+		}
+		sdp.NodeAffinity = affinity
+		sdpHost.NodeAffinity = affinity
+	} else {
+		affinity := corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{
+				{
+					Weight: 100,
+					Preference: corev1.NodeSelectorTerm{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{Key: "netperf", Operator: corev1.NodeSelectorOpIn, Values: []string{"server"}},
+						},
+					},
+				},
+			},
+		}
+		sdp.NodeAffinity = affinity
+		sdpHost.NodeAffinity = affinity
+	}
+	if ncount > 1 && !s.NodeLocal {
+		antiAffinity := corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{Key: "role", Operator: metav1.LabelSelectorOpIn, Values: []string{clientAcrossRole}},
+						},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		}
+		sdp.PodAntiAffinity = antiAffinity
+		antiAffinity = corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{Key: "role", Operator: metav1.LabelSelectorOpIn, Values: []string{hostNetClientRole}},
+						},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			},
+		}
+		sdpHost.PodAntiAffinity = antiAffinity
+	}
+	if ncount > 1 {
+		if s.Pod {
+			if s.HostNetwork {
+				s.ServerHost, err = deployDeployment(client, sdpHost)
+				if err != nil {
+					return err
+				}
+			} else {
+				log.Info("HostNetwork is not supported for server VM... skipping")
+			}
+		}
+		// If HostNetworkOnly mode, get server node info from host network pods
+		if s.HostNetworkOnly && s.HostNetwork {
+			s.ServerNodeInfo, err = GetPodNodeInfo(client, labels.Set(sdpHost.Labels).String())
+			if err != nil {
+				return err
+			}
+		}
+	}
+	// Only create regular server pods if not in HostNetworkOnly mode (unless NodeLocal where we use regular pods with hostNetwork)
+	if !s.HostNetworkOnly || s.NodeLocal {
+		if s.Pod {
+			s.Server, err = deployDeployment(client, sdp)
+			if err != nil {
+				return err
+			}
+			s.ServerNodeInfo, err = GetPodNodeInfo(client, labels.Set(sdp.Labels).String())
+			if err != nil {
+				return err
+			}
+			if !s.NodeLocal {
+				s.ClientNodeInfo, err = GetPodNodeInfo(client, labels.Set(cdpAcross.Labels).String())
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if s.VM {
+			err = launchServerVM(s, vmServerRole, &sdp.PodAntiAffinity, &sdp.NodeAffinity)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// ExtractBridgeIp extracts the bridge network IP address from pod network status annotation
+func ExtractBridgeIp(pod corev1.Pod, bridgeNetworkName, bridgeNamespace string) (string, error) {
+	networkStatusJson := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+	if networkStatusJson == "" {
+		return "", fmt.Errorf("no network status annotation found on pod %s", pod.Name)
+	}
+
+	var networkStatuses []struct {
+		Name      string   `json:"name"`
+		Interface string   `json:"interface"`
+		IPs       []string `json:"ips"`
+		Default   bool     `json:"default,omitempty"`
+	}
+
+	err := json.Unmarshal([]byte(networkStatusJson), &networkStatuses)
+	if err != nil {
+		return "", fmt.Errorf("error unmarshalling network status: %v", err)
+	}
+
+	// Look for the bridge network by name
+	expectedNetworkName := fmt.Sprintf("%s/%s", bridgeNamespace, bridgeNetworkName)
+	for _, netStatus := range networkStatuses {
+		if netStatus.Name == expectedNetworkName && len(netStatus.IPs) > 0 {
+			// Return the first IP (should be IPv4)
+			for _, ip := range netStatus.IPs {
+				if strings.Contains(ip, ".") {
+					log.Debugf("Pod %s bridge network IP: %s", pod.Name, ip)
+					return ip, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("bridge network IP not found for %s on pod %s", expectedNetworkName, pod.Name)
+}
+
+// ExtractSriovIp extracts the SR-IOV network IP address from pod network status annotation
+func ExtractSriovIp(pod corev1.Pod) (string, error) {
+	networkStatusJson := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+	if networkStatusJson == "" {
+		return "", fmt.Errorf("no network status annotation found on pod %s", pod.Name)
+	}
+
+	var networkStatuses []struct {
+		Name      string   `json:"name"`
+		Interface string   `json:"interface"`
+		IPs       []string `json:"ips"`
+		Default   bool     `json:"default,omitempty"`
+	}
+
+	err := json.Unmarshal([]byte(networkStatusJson), &networkStatuses)
+	if err != nil {
+		return "", fmt.Errorf("error unmarshalling network status: %v", err)
+	}
+
+	expectedNetworkName := fmt.Sprintf("%s/%s", namespace, SriovNadName)
+	for _, netStatus := range networkStatuses {
+		if netStatus.Name == expectedNetworkName && len(netStatus.IPs) > 0 {
+			for _, ip := range netStatus.IPs {
+				if strings.Contains(ip, ".") {
+					log.Debugf("Pod %s SR-IOV network IP: %s", pod.Name, ip)
+					return ip, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("SR-IOV network IP not found for %s on pod %s", expectedNetworkName, pod.Name)
+}
+
+// Extract the UDN Ip address of the server (or the client) from the annotations - Support only ipv4
+func ExtractUdnIp(pod corev1.Pod, networkName string) (string, error) {
+	for key, value := range pod.Annotations {
+		log.Debugf("Pod Annotation key: %s, value: %s", key, value)
+	}
+	podNetworksJson := pod.Annotations["k8s.ovn.org/pod-networks"]
+	var root map[string]json.RawMessage
+	err := json.Unmarshal([]byte(podNetworksJson), &root)
+	if err != nil {
+		log.Error("Error unmarshalling JSON:", err)
+		return "", err
+	}
+	//
+	var udnData PodNetworksData
+	err = json.Unmarshal(root[namespace+"/"+networkName], &udnData)
+	if err != nil {
+		log.Error("UDN pod annotations does not match PodNetworksData structure:", err)
+		return "", err
+	}
+	// Extract the IPv4 address
+	var ipv4 net.IP
+	for _, ip := range udnData.IPAddresses {
+		if strings.Contains(ip, ".") { // Check if it's an IPv4 address
+			ipv4, _, err = net.ParseCIDR(ip)
+			if err != nil {
+				log.Error("Error w/ IPv4 annotations:", err)
+				return "", err
+			}
+			log.Debugf("Pod %s UDN Ip: %s\n", pod.Name, ipv4.String())
+		}
+	}
+	return ipv4.String(), nil
+}
+
+// launchServerVM will create the ServerVM with the specific node and pod affinity.
+func launchServerVM(perf *config.PerfScenarios, name string, podAff *corev1.PodAntiAffinity, nodeAff *corev1.NodeAffinity) error {
+	_, err := CreateVMServer(perf.KClient, name, name, *podAff, *nodeAff, perf.VMImage, perf.BridgeServerNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
+		perf.LocalnetNetwork != "", perf.LocalnetServerNetwork,
+		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads)
+	if err != nil {
+		return err
+	}
+	err = WaitForVMI(perf.KClient, name)
+	if err != nil {
+		return err
+	}
+
+	perf.VMServer, err = GetPods(perf.ClientSet, fmt.Sprintf("app=%s", name))
+	if err != nil {
+		return err
+	}
+
+	perf.ServerNodeInfo, _ = GetPodNodeInfo(perf.ClientSet, fmt.Sprintf("app=%s", name))
+
+	if perf.SriovNetwork != "" && len(perf.VMServer.Items) > 0 {
+		err = ConfigureVMSriovIP(name, perf.VMServer.Items[0])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// launchClientVM will create the ClientVM with the specific node and pod affinity.
+func launchClientVM(perf *config.PerfScenarios, name string, podAff *corev1.PodAntiAffinity, nodeAff *corev1.NodeAffinity) error {
+	host, err := CreateVMClient(perf.KClient, perf.ClientSet, perf.DClient, name, podAff, nodeAff, perf.VMImage, perf.BridgeClientNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
+		perf.LocalnetNetwork != "", perf.LocalnetClientNetwork,
+		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads)
+	if err != nil {
+		return err
+	}
+	perf.VMHost = host
+	perf.VMName = name // Set VM name for virtctl usage
+	err = WaitForVMI(perf.KClient, name)
+	if err != nil {
+		return err
+	}
+	perf.VMClientAcross, err = GetPods(perf.ClientSet, fmt.Sprintf("app=%s", name))
+	if err != nil {
+		return err
+	}
+	perf.ClientNodeInfo, _ = GetPodNodeInfo(perf.ClientSet, fmt.Sprintf("app=%s", name))
+
+	if perf.SriovNetwork != "" && len(perf.VMClientAcross.Items) > 0 {
+		err = ConfigureVMSriovIP(name, perf.VMClientAcross.Items[0])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func zoneNodeSelectorExpression(c kubernetes.Clientset, zone string, role string) []corev1.PreferredSchedulingTerm {
+	labeled := areNodesLabeled(&c)
+	if !labeled && zone != "" {
+		return []corev1.PreferredSchedulingTerm{
+			{
+				Weight: 100,
+				Preference: corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "netperf", Operator: corev1.NodeSelectorOpIn, Values: []string{role}},
+						{Key: "topology.kubernetes.io/zone", Operator: corev1.NodeSelectorOpIn, Values: []string{zone}},
+					},
+				},
+			},
+		}
+	}
+	return []corev1.PreferredSchedulingTerm{
+		{
+			Weight: 100,
+			Preference: corev1.NodeSelectorTerm{
+				MatchExpressions: []corev1.NodeSelectorRequirement{
+					{Key: "netperf", Operator: corev1.NodeSelectorOpIn, Values: []string{role}},
+				},
+			},
+		},
+	}
+}
+
 // deployDeployment Manages the creation and waits for the pods to become ready.
 // returns a podList which is associated with the Deployment.
-func deployDeployment(client *kubernetes.Clientset, dp DeploymentParams) (apiv1.PodList, error) {
-	pods := apiv1.PodList{}
+func deployDeployment(client *kubernetes.Clientset, dp DeploymentParams) (corev1.PodList, error) {
+	pods := corev1.PodList{}
 	_, err := CreateDeployment(dp, client)
 	if err != nil {
-		return pods, fmt.Errorf("😥 Unable to create deployment")
+		return pods, fmt.Errorf("😥 Unable to create deployment: %v", err)
 	}
 	_, err = WaitForReady(client, dp)
 	if err != nil {
 		return pods, err
 	}
 	// Retrieve pods which match the server/client role labels
-	pods, err = GetPods(client, dp)
+	pods, err = GetPods(client, labels.Set(dp.Labels).String())
 	if err != nil {
 		return pods, err
 	}
@@ -317,7 +1472,7 @@ func deployDeployment(client *kubernetes.Clientset, dp DeploymentParams) (apiv1.
 // WaitForReady accepts the client and deployment params to determine which pods to watch.
 // It will return a bool based on if the pods ever become ready before we move on.
 func WaitForReady(c *kubernetes.Clientset, dp DeploymentParams) (bool, error) {
-	log.Info("⏰ Checking for Pods to become ready...")
+	log.Infof("⏰ Checking for %s Pods to become ready...", dp.Name)
 	dw, err := c.AppsV1().Deployments(dp.Namespace).Watch(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return false, err
@@ -326,7 +1481,7 @@ func WaitForReady(c *kubernetes.Clientset, dp DeploymentParams) (bool, error) {
 	for event := range dw.ResultChan() {
 		d, ok := event.Object.(*appsv1.Deployment)
 		if !ok {
-			fmt.Println("❌ Issue with the Deployment")
+			log.Error("❌ Issue with the Deployment")
 		}
 		if d.Name == dp.Name {
 			if d.Status.ReadyReplicas == 1 {
@@ -337,25 +1492,55 @@ func WaitForReady(c *kubernetes.Clientset, dp DeploymentParams) (bool, error) {
 	return false, fmt.Errorf("❌ Deployment had issues")
 }
 
+func areNodesLabeled(c *kubernetes.Clientset) bool {
+	server, err := c.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "netperf=server"})
+	if err != nil {
+		log.Errorf("Unable to query nodes: %v", err)
+	}
+	client, err := c.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "netperf=client"})
+	if err != nil {
+		log.Errorf("Unable to query nodes: %v", err)
+	}
+	if len(server.Items) == 0 && len(client.Items) == 0 {
+		return false
+	}
+	return true
+}
+
+// WaitForDelete return nil if the namespace is deleted, error otherwise
+func waitForNamespaceDelete(c *kubernetes.Clientset, nsName string) error {
+	log.Infof("⏰ Waiting for %s Namespace to be deleted...", nsName)
+	// Timeout in seconds
+	ns, err := c.CoreV1().Namespaces().Watch(context.TODO(), metav1.ListOptions{FieldSelector: "metadata.name=" + nsName})
+	if err != nil {
+		return err
+	}
+	defer ns.Stop()
+	for event := range ns.ResultChan() {
+		if event.Type == watch.Deleted {
+			return nil
+		}
+	}
+	return fmt.Errorf("❌ Namespace delete issues: %v", err)
+}
+
 // GetZone will determine if we have a multiAZ/Zone cloud.
-func GetZone(c *kubernetes.Clientset) (string, int, error) {
+// returns string of the zone, int of the node count in that zone, error if encountered a problem.
+func GetZone(c *kubernetes.Clientset) (string, map[string]int, error) {
 	zones := map[string]int{}
 	zone := ""
 	lz := ""
-	num_nodes := 0
 	n, err := c.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker="})
 	if err != nil {
-		return "", num_nodes, fmt.Errorf("Unable to query nodes")
+		return "", zones, fmt.Errorf("unable to query nodes: %v", err)
 	}
 	for _, l := range n.Items {
 		if len(l.GetLabels()["topology.kubernetes.io/zone"]) < 1 {
-			return "", num_nodes, fmt.Errorf("⚠️  No zone label")
+			return "", zones, fmt.Errorf("⚠️  No zone label")
 		}
 		if _, ok := zones[l.GetLabels()["topology.kubernetes.io/zone"]]; ok {
 			zone = l.GetLabels()["topology.kubernetes.io/zone"]
-			num_nodes = 2
-			// Simple check, no need to determine all the zones with > 1 node.
-			break
+			zones[zone]++
 		} else {
 			zones[l.GetLabels()["topology.kubernetes.io/zone"]] = 1
 			lz = l.GetLabels()["topology.kubernetes.io/zone"]
@@ -363,11 +1548,9 @@ func GetZone(c *kubernetes.Clientset) (string, int, error) {
 	}
 	// No zone had > 1, use the last zone.
 	if zone == "" {
-		log.Warn("⚠️  Single node per zone")
-		num_nodes = 1
 		zone = lz
 	}
-	return zone, num_nodes, nil
+	return zone, zones, nil
 }
 
 // CreateDeployment will create the different deployments we need to do network performance tests
@@ -381,6 +1564,45 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 	}
 	log.Infof("🚀 Starting Deployment for: %s in namespace: %s", dp.Name, dp.Namespace)
 	dc := client.AppsV1().Deployments(dp.Namespace)
+
+	// Add containers to deployment
+	var cmdContainers []corev1.Container
+	for i := 0; i < len(dp.Commands); i++ {
+		// each container should have a unique name
+		containerName := fmt.Sprintf("%s-%d", dp.Name, i)
+		container := corev1.Container{
+			Name:            containerName,
+			Image:           dp.Image,
+			Command:         dp.Commands[i],
+			ImagePullPolicy: corev1.PullAlways,
+		}
+
+		// Add privileged security context if requested
+		if dp.Privileged {
+			container.SecurityContext = &corev1.SecurityContext{
+				Privileged: ptr.To(true),
+			}
+		}
+
+		// Add resource requests (e.g., SR-IOV VFs)
+		if len(dp.ResourceRequests) > 0 {
+			container.Resources = corev1.ResourceRequirements{
+				Requests: dp.ResourceRequests,
+				Limits:   dp.ResourceRequests, // extended resources require limits == requests
+			}
+		}
+
+		cmdContainers = append(cmdContainers, container)
+	}
+
+	// Merge network annotations with default annotations
+	annotations := map[string]string{
+		"sidecar.istio.io/inject": "true",
+	}
+	for k, v := range dp.NetworkAnnotations {
+		annotations[k] = v
+	}
+
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: dp.Name,
@@ -390,21 +1612,17 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 			Selector: &metav1.LabelSelector{
 				MatchLabels: dp.Labels,
 			},
-			Template: apiv1.PodTemplateSpec{
+			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: dp.Labels,
+					Labels:      dp.Labels,
+					Annotations: annotations,
 				},
-				Spec: apiv1.PodSpec{
-					ServiceAccountName: sa,
-					HostNetwork:        dp.HostNetwork,
-					Containers: []apiv1.Container{
-						{
-							Name:    dp.Name,
-							Image:   dp.Image,
-							Command: dp.Command,
-						},
-					},
-					Affinity: &apiv1.Affinity{
+				Spec: corev1.PodSpec{
+					TerminationGracePeriodSeconds: ptr.To(int64(1)),
+					ServiceAccountName:            sa,
+					HostNetwork:                   dp.HostNetwork,
+					Containers:                    cmdContainers,
+					Affinity: &corev1.Affinity{
 						NodeAffinity:    &dp.NodeAffinity,
 						PodAffinity:     &dp.PodAffinity,
 						PodAntiAffinity: &dp.PodAntiAffinity,
@@ -416,106 +1634,156 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 	return dc.Create(context.TODO(), deployment, metav1.CreateOptions{})
 }
 
-// GetPodNodeInfo collects the node information for a specific pod
-func GetPodNodeInfo(c *kubernetes.Clientset, dp DeploymentParams) (metrics.NodeInfo, error) {
+// GetPodNodeInfo collects the node information for a node running a pod with a specific label
+func GetPodNodeInfo(c *kubernetes.Clientset, label string) (metrics.NodeInfo, error) {
 	var info metrics.NodeInfo
-	d, err := c.AppsV1().Deployments(dp.Namespace).Get(context.TODO(), dp.Name, metav1.GetOptions{})
+	listOpt := metav1.ListOptions{
+		LabelSelector: label,
+		FieldSelector: "status.phase=Running",
+	}
+	pods, err := c.CoreV1().Pods(namespace).List(context.TODO(), listOpt)
 	if err != nil {
-		return info, fmt.Errorf("❌ Failure to capture deployment")
+		return info, fmt.Errorf("❌ Failure to capture pods: %v", err)
 	}
-	selector, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
+	info.NodeName = pods.Items[0].Spec.NodeName
+	info.IP = pods.Items[0].Status.HostIP
+	node, err := c.CoreV1().Nodes().Get(context.TODO(), info.NodeName, metav1.GetOptions{})
 	if err != nil {
-		return info, fmt.Errorf("❌ Failure to capture deployment label")
+		return info, err
 	}
-	pods, err := c.CoreV1().Pods(dp.Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String(), FieldSelector: "status.phase=Running"})
-	if err != nil {
-		return info, fmt.Errorf("❌ Failure to capture pods")
-	}
-	for pod := range pods.Items {
-		p := pods.Items[pod]
-		if pods.Items[pod].DeletionTimestamp != nil {
-			continue
-		} else {
-			info.IP = p.Status.HostIP
-			info.Hostname = p.Spec.NodeName
-		}
-	}
+	info.NodeSystemInfo = node.Status.NodeInfo
+	log.Debugf("Machine with label %s is Running on %s with IP %s", label, info.NodeName, info.IP)
 	return info, nil
 }
 
-// GetPods searches for a specific set of pods from DeploymentParms
-// It returns a PodList if the deployment is found.
-// NOTE : Since we can update the replicas to be > 1, is why I return a PodList.
-func GetPods(c *kubernetes.Clientset, dp DeploymentParams) (apiv1.PodList, error) {
-	d, err := c.AppsV1().Deployments(dp.Namespace).Get(context.TODO(), dp.Name, metav1.GetOptions{})
-	npl := apiv1.PodList{}
+// GetPods returns pods with a specific label
+func GetPods(c *kubernetes.Clientset, label string) (corev1.PodList, error) {
+	listOpt := metav1.ListOptions{
+		LabelSelector: label,
+		FieldSelector: "status.phase=Running",
+	}
+	log.Infof("Looking for pods with label %s", fmt.Sprint(label))
+	pods, err := c.CoreV1().Pods(namespace).List(context.TODO(), listOpt)
 	if err != nil {
-		return npl, fmt.Errorf("❌ Failure to capture deployment")
+		return *pods, fmt.Errorf("❌ Failure to capture pods: %v", err)
 	}
-	selector, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
-	if err != nil {
-		return npl, fmt.Errorf("❌ Failure to capture deployment label")
-	}
-	pods, err := c.CoreV1().Pods(dp.Namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String(), FieldSelector: "status.phase=Running"})
-	if err != nil {
-		return npl, fmt.Errorf("❌ Failure to capture pods")
-	}
-	for pod := range pods.Items {
-		if pods.Items[pod].DeletionTimestamp != nil {
-			continue
-		} else {
-			npl.Items = append(npl.Items, pods.Items[pod])
-		}
-	}
-	return npl, nil
+	return *pods, nil
+
 }
 
 // CreateService will build a k8s service
-func CreateService(sp ServiceParams, client *kubernetes.Clientset) (*apiv1.Service, error) {
+func CreateService(sp ServiceParams, client *kubernetes.Clientset) (*corev1.Service, error) {
 	s, err := client.CoreV1().Services(sp.Namespace).Get(context.TODO(), sp.Name, metav1.GetOptions{})
+	log.Debugf("Looking for service %s in namespace %s", sp.Name, sp.Namespace)
 	if err == nil {
 		log.Info("♻️  Using existing Service")
 		return s, nil
 	}
 	log.Infof("🚀 Creating service for %s in namespace %s", sp.Name, sp.Namespace)
 	sc := client.CoreV1().Services(sp.Namespace)
-	service := &apiv1.Service{
+	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sp.Name,
 			Namespace: sp.Namespace,
 		},
-		Spec: apiv1.ServiceSpec{
-			Ports: []apiv1.ServicePort{
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
 				{
-					Name:       fmt.Sprintf("%s-ctl", sp.Name),
-					Protocol:   apiv1.ProtocolTCP,
+					Name:       fmt.Sprintf("%s-tcp-ctl", sp.Name),
+					Protocol:   corev1.ProtocolTCP,
 					TargetPort: intstr.Parse(fmt.Sprintf("%d", sp.CtlPort)),
 					Port:       sp.CtlPort,
 				},
 				{
-					Name:       fmt.Sprintf("%s-data-tcp", sp.Name),
-					Protocol:   apiv1.ProtocolTCP,
-					TargetPort: intstr.Parse(fmt.Sprintf("%d", sp.DataPort)),
-					Port:       sp.DataPort,
-				},
-				{
-					Name:       fmt.Sprintf("%s-data-udp", sp.Name),
-					Protocol:   apiv1.ProtocolUDP,
-					TargetPort: intstr.Parse(fmt.Sprintf("%d", sp.DataPort)),
-					Port:       sp.DataPort,
+					Name:       fmt.Sprintf("%s-udp-ctl", sp.Name),
+					Protocol:   corev1.ProtocolUDP,
+					TargetPort: intstr.Parse(fmt.Sprintf("%d", sp.CtlPort)),
+					Port:       sp.CtlPort,
 				},
 			},
-			Type:     apiv1.ServiceType("ClusterIP"),
+			Type:     corev1.ServiceType("ClusterIP"),
 			Selector: sp.Labels,
 		},
+	}
+	for _, port := range sp.DataPorts {
+		service.Spec.Ports = append(service.Spec.Ports,
+			corev1.ServicePort{
+				Name:       fmt.Sprintf("%s-tcp-%d", sp.Name, port),
+				Protocol:   corev1.ProtocolTCP,
+				TargetPort: intstr.Parse(fmt.Sprintf("%d", port)),
+				Port:       port,
+			},
+			corev1.ServicePort{
+				Name:       fmt.Sprintf("%s-udp-%d", sp.Name, port),
+				Protocol:   corev1.ProtocolUDP,
+				TargetPort: intstr.Parse(fmt.Sprintf("%d", port)),
+				Port:       port,
+			},
+		)
 	}
 	return sc.Create(context.TODO(), service, metav1.CreateOptions{})
 }
 
-// DestroyDeployment cleans up a specific deployment
-func DestroyDeployment(client *kubernetes.Clientset, dp *appsv1.Deployment) error {
+// GetServices retrieve all services for a given namespoace, in this case for netperf
+func GetServices(client *kubernetes.Clientset, namespace string) (*corev1.ServiceList, error) {
+	services, err := client.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return services, nil
+}
+
+// GetDeployments retrieve all deployments for a given namespace, in this case for netperf
+func GetDeployments(client *kubernetes.Clientset, namespace string) (*appsv1.DeploymentList, error) {
+	dps, err := client.AppsV1().Deployments(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return dps, nil
+}
+
+// DestroyService cleans up a specific service from a namespace
+func DestroyService(client *kubernetes.Clientset, serv corev1.Service) error {
 	deletePolicy := metav1.DeletePropagationForeground
-	return client.AppsV1().Deployments(dp.Namespace).Delete(context.TODO(), dp.Name, metav1.DeleteOptions{
+	return client.CoreV1().Services(serv.Namespace).Delete(context.TODO(), serv.Name, metav1.DeleteOptions{
 		PropagationPolicy: &deletePolicy,
+	})
+}
+
+// DestroyNamespace cleans up the namespace k8s-netperf created
+func DestroyNamespace(client *kubernetes.Clientset) error {
+	_, err := client.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
+	if err == nil {
+		log.Info("Cleaning resources created by k8s-netperf")
+		err = client.CoreV1().Namespaces().Delete(context.TODO(), namespace, metav1.DeleteOptions{})
+		if err != nil {
+			return err
+		}
+		return waitForNamespaceDelete(client, namespace)
+	}
+	return nil
+}
+
+// DestroyDeployment cleans up a specific deployment from a namespace
+func DestroyDeployment(client *kubernetes.Clientset, dp appsv1.Deployment) error {
+	deletePolicy := metav1.DeletePropagationForeground
+	gracePeriod := int64(0)
+	return client.AppsV1().Deployments(dp.Namespace).Delete(context.TODO(), dp.Name, metav1.DeleteOptions{
+		PropagationPolicy:  &deletePolicy,
+		GracePeriodSeconds: &gracePeriod,
+	})
+}
+
+func DestroyCUdn(dynamicClient *dynamic.DynamicClient, cudn string) error {
+	deletePolicy := metav1.DeletePropagationForeground
+	gracePeriod := int64(0)
+	gvr := schema.GroupVersionResource{
+		Group:    "k8s.ovn.org",
+		Version:  "v1",
+		Resource: "clusteruserdefinednetworks",
+	}
+	return dynamicClient.Resource(gvr).Delete(context.TODO(), cudn, metav1.DeleteOptions{
+		PropagationPolicy:  &deletePolicy,
+		GracePeriodSeconds: &gracePeriod,
 	})
 }

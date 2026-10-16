@@ -2,299 +2,1069 @@ package main
 
 import (
 	"context"
-	"flag"
+	encodeJson "encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/cloud-bulldozer/go-commons/v2/indexers"
+	ocpmetadata "github.com/cloud-bulldozer/go-commons/v2/ocp-metadata"
+	"github.com/cloud-bulldozer/go-commons/v2/prometheus"
+	cmdVersion "github.com/cloud-bulldozer/go-commons/v2/version"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/archive"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/config"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/drivers"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/k8s"
+	kubevirtv1 "github.com/cloud-bulldozer/k8s-netperf/pkg/kubevirt/client-go/clientset/versioned/typed/core/v1"
+	log "github.com/cloud-bulldozer/k8s-netperf/pkg/logging"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/metrics"
+	result "github.com/cloud-bulldozer/k8s-netperf/pkg/results"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/sample"
+	"github.com/cloud-bulldozer/k8s-netperf/pkg/virtctl"
 	"github.com/google/uuid"
-	"github.com/jtaleric/k8s-netperf/pkg/archive"
-	"github.com/jtaleric/k8s-netperf/pkg/config"
-	"github.com/jtaleric/k8s-netperf/pkg/k8s"
-	log "github.com/jtaleric/k8s-netperf/pkg/logging"
-	"github.com/jtaleric/k8s-netperf/pkg/metrics"
-	"github.com/jtaleric/k8s-netperf/pkg/netperf"
-	result "github.com/jtaleric/k8s-netperf/pkg/results"
+	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-func main() {
+const index = "k8s-netperf"
+const retry = 3
 
-	cfgfile := flag.String("config", "netperf.yml", "K8s netperf Configuration File")
-	nl := flag.Bool("local", false, "Run Netperf with pod/server on the same node")
-	full := flag.Bool("all", false, "Run all tests scenarios - hostNet and podNetwork (if possible)")
-	debug := flag.Bool("debug", false, "Enable debug log")
-	promURL := flag.String("prom", "", "Prometheus URL")
-	id := flag.String("uuid", "", "User provided UUID")
-	searchURL := flag.String("search", "", "OpenSearch URL, if you have auth, pass in the format of https://user:pass@url:port")
-	showMetrics := flag.Bool("metrics", false, "Show all system metrics retrieved from prom")
-	tcpt := flag.Float64("tcp-tolerance", 10, "Allowed %diff from hostNetwork to podNetwork, anything above tolerance will result in k8s-netperf exiting 1.")
-	flag.Parse()
+var (
+	cfgfile           string
+	nl                bool
+	clean             bool
+	netperf           bool
+	iperf3            bool
+	uperf             bool
+	ibWriteBw         string
+	udnl2             bool
+	udnl3             bool
+	cudn              string
+	udnPluginBinding  string
+	acrossAZ          bool
+	full              bool
+	hostNetOnly       bool
+	pod               bool
+	vm                bool
+	vmimage           string
+	useVirtctl        bool
+	debug             bool
+	bridge            string
+	bridgeNetwork     string
+	bridgeNamespace   string
+	sriov             string
+	sriovNodeSelector string
+	macvlan           string
+	localnet          string
+	localnetConfig    string
+	promURL           string
+	id                string
+	searchURL         string
+	showMetrics       bool
+	tcpt              float64
+	json              bool
+	version           bool
+	csvArchive        bool
+	searchIndex       string
+	serverIPAddr      string
+	sockets           uint32
+	cores             uint32
+	threads           uint32
+	privileged        bool
+)
 
-	uid := ""
-	if len(*id) > 0 {
-		uid = *id
-	} else {
-		u := uuid.New()
-		uid = fmt.Sprintf("%s", u.String())
-	}
-
-	if *debug {
-		log.SetDebug()
-	}
-
-	cfg, err := config.ParseConf(*cfgfile)
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-
-	// Read in k8s config
-	kconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		clientcmd.NewDefaultClientConfigLoadingRules(),
-		&clientcmd.ConfigOverrides{})
-	rconfig, err := kconfig.ClientConfig()
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	client, err := kubernetes.NewForConfig(rconfig)
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	s := config.PerfScenarios{
-		HostNetwork: *full,
-		NodeLocal:   *nl,
-		RestConfig:  *rconfig,
-		Configs:     cfg,
-	}
-	// Get node count
-	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker="})
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	if !s.NodeLocal && len(nodes.Items) < 2 {
-		log.Error("Node count too low to run pod to pod across nodes.")
-		log.Error("To run k8s-netperf on a single node deployment pass -local.")
-		log.Error("	$ k8s-netperf -local")
-		os.Exit(1)
-	}
-
-	pavail := false
-	pcon, found := metrics.Discover()
-	if !found {
-		// Assume we are not running against OpenShift
-		if len(*promURL) > 1 {
-			pcon.URL = *promURL
-			pavail = metrics.PromCheck(pcon)
-		}
-	} else {
-		// If the env isn't OpenShift assume the user is providing the path to prom
-		if !pcon.OpenShift {
-			pcon.URL = *promURL
-			if len(*promURL) > 1 {
-				pavail = metrics.PromCheck(pcon)
-			}
-		} else {
-			if len(*promURL) > 1 {
-				pcon.URL = *promURL
-			}
-			pavail = metrics.PromCheck(pcon)
-		}
-	}
-
-	if !pavail {
-		log.Warn("😥 Prometheus is not available")
-	}
-
-	// Build the SUT (Deployments)
-	err = k8s.BuildSUT(client, &s)
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-
-	var sr result.ScenarioResults
-
-	// Run through each test
-	for _, nc := range s.Configs {
-		// Determine the metric for the test
-		metric := string("OP/s")
-		if strings.Contains(nc.Profile, "STREAM") {
-			metric = "Mb/s"
-		}
-		var serverIP string
-		var service bool
-		service = false
-		if nc.Service {
-			service = true
-			serverIP = s.Service.Spec.ClusterIP
-		} else {
-			serverIP = s.Server.Items[0].Status.PodIP
-		}
-		if !s.NodeLocal {
-			npr := result.Data{}
-			npr.Config = nc
-			npr.Metric = metric
-			npr.Service = service
-			npr.HostNetwork = true
-			if !nc.Service && *full {
-				npr.StartTime = time.Now()
-				for i := 0; i < nc.Samples; i++ {
-					r, err := netperf.Run(client, s.RestConfig, nc, s.ClientHost, s.ServerHost.Items[0].Status.PodIP)
-					if err != nil {
-						log.Error(err)
-						log.Error("Note : Running netperf with hostNetwork will require some host configuration -- poking a hole in the firewall.")
-						os.Exit(1)
-					}
-					nr, err := netperf.ParseResults(&r, nc)
-					if err != nil {
-						log.Error(err)
-						os.Exit(1)
-					}
-					npr.ThroughputSummary = append(npr.ThroughputSummary, nr.Throughput)
-					npr.LatencySummary = append(npr.LatencySummary, nr.Latency99ptile)
-				}
-				npr.EndTime = time.Now()
-				npr.ClientNodeInfo = s.ClientNodeInfo
-				npr.ServerNodeInfo = s.ServerNodeInfo
-				sr.Results = append(sr.Results, npr)
-			}
-			npr = result.Data{}
-			npr.Config = nc
-			npr.Metric = metric
-			npr.Service = service
-			npr.SameNode = false
-			npr.StartTime = time.Now()
-			for i := 0; i < nc.Samples; i++ {
-				r, err := netperf.Run(client, s.RestConfig, nc, s.ClientAcross, serverIP)
-				if err != nil {
-					log.Error(err)
-					os.Exit(1)
-				}
-				nr, err := netperf.ParseResults(&r, nc)
-				if err != nil {
-					log.Error(err)
-					os.Exit(1)
-				}
-				npr.ThroughputSummary = append(npr.ThroughputSummary, nr.Throughput)
-				npr.LatencySummary = append(npr.LatencySummary, nr.Latency99ptile)
-			}
-			npr.EndTime = time.Now()
-			npr.ClientNodeInfo = s.ClientNodeInfo
-			npr.ServerNodeInfo = s.ServerNodeInfo
-			sr.Results = append(sr.Results, npr)
-		} else {
-			// Reset the result as we are now testing a different scenario
-			// Consider breaking the result per-scenario-config
-			npr := result.Data{}
-			npr.Config = nc
-			npr.Metric = metric
-			npr.Service = service
-			npr.SameNode = true
-			npr.StartTime = time.Now()
-			for i := 0; i < nc.Samples; i++ {
-				r, err := netperf.Run(client, s.RestConfig, nc, s.Client, serverIP)
-				if err != nil {
-					log.Error(err)
-					os.Exit(1)
-				}
-				nr, err := netperf.ParseResults(&r, nc)
-				if err != nil {
-					log.Error(err)
-					os.Exit(1)
-				}
-				npr.ThroughputSummary = append(npr.ThroughputSummary, nr.Throughput)
-				npr.LatencySummary = append(npr.LatencySummary, nr.Latency99ptile)
-			}
-			npr.EndTime = time.Now()
-			npr.ClientNodeInfo = s.ClientNodeInfo
-			npr.ServerNodeInfo = s.ServerNodeInfo
-			sr.Results = append(sr.Results, npr)
-		}
-	}
-
-	var fTime time.Time
-	var lTime time.Time
-	if pavail {
-		for i, npr := range sr.Results {
-			sr.Results[i].ClientMetrics, _ = metrics.QueryNodeCPU(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime)
-			sr.Results[i].ServerMetrics, _ = metrics.QueryNodeCPU(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime)
-			sr.Results[i].ClientPodCPU, _ = metrics.TopPodCPU(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime)
-			sr.Results[i].ServerPodCPU, _ = metrics.TopPodCPU(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime)
-			fTime = npr.StartTime
-			lTime = npr.EndTime
-		}
-	}
-
-	if len(*searchURL) > 1 {
-		// Metadata
-		node := metrics.NodeDetails(pcon)
-		sr.Metadata.Kernel = node.Metric.Kernel
-		sr.Metadata.Kubelet = node.Metric.Kubelet
-		sr.Metadata.OCPVersion = metrics.OCPversion(pcon, fTime, lTime)
-		sr.Metadata.Platform = metrics.Platform(pcon)
-		sec, err := metrics.IPSecEnabled(pcon, fTime, lTime)
-		if err == nil {
-			sr.Metadata.IPsec = sec
-		}
-		mtu, err := metrics.NodeMTU(pcon)
-		if err == nil {
-			sr.Metadata.MTU = mtu
-		}
-
-		jdocs, err := archive.BuildDocs(sr, uid)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-		esClient, err := archive.Connect(*searchURL, true)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-		err = archive.IndexDocs(esClient, jdocs)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-	}
-
-	result.ShowStreamResult(sr)
-	result.ShowRRResult(sr)
-	result.ShowLatencyResult(sr)
-	if *showMetrics {
-		result.ShowNodeCPU(sr)
-		result.ShowPodCPU(sr)
-	}
-	err = archive.WriteCSVResult(sr)
-	if err != nil {
-		log.Error(err)
-		os.Exit(1)
-	}
-	if pavail {
-		err = archive.WritePromCSVResult(sr)
-		if err != nil {
-			log.Error(err)
-			os.Exit(1)
-		}
-	}
-	// Initially we are just checking against TCP_STREAM results.
-	if result.CheckHostResults(sr) {
-		diff, err := result.TCPThroughputDiff(sr)
-		if err != nil {
-			fmt.Println("Unable to calculate difference between HostNetwork and PodNetwork")
-			os.Exit(1)
-		}
-		if diff < *tcpt {
+var rootCmd = &cobra.Command{
+	Use:   "k8s-netperf",
+	Short: "A tool to run network performance tests in Kubernetes cluster",
+	PreRun: func(cmd *cobra.Command, args []string) {
+		log.Infof("Starting k8s-netperf (%s@%s)", cmdVersion.Version, cmdVersion.GitCommit)
+	},
+	Run: func(cmd *cobra.Command, args []string) {
+		var acrossAZ bool
+		var sr result.ScenarioResults
+		if version {
+			fmt.Println("Version:", cmdVersion.Version)
+			fmt.Println("Git Commit:", cmdVersion.GitCommit)
+			fmt.Println("Build Date:", cmdVersion.BuildDate)
+			fmt.Println("Go Version:", cmdVersion.GoVersion)
+			fmt.Println("OS/Arch:", cmdVersion.OsArch)
 			os.Exit(0)
 		}
-		fmt.Printf("😥 TCP Stream percent difference when comparing hostNetwork to podNetwork is greater than %.1f percent (%.1f percent)\r\n", *tcpt, diff)
+		// Check if ibWriteBw flag was set and has a valid value
+		ibWriteBwEnabled := cmd.Flags().Changed("ib-write-bw")
+		if ibWriteBwEnabled && strings.TrimSpace(ibWriteBw) == "" {
+			log.Fatalf("😭 --ib-write-bw requires nic:gid parameter (e.g., --ib-write-bw=mlx5_0:0)")
+		}
+
+		if !uperf && !netperf && !iperf3 && !ibWriteBwEnabled {
+			log.Fatalf("😭 At least one driver needs to be enabled")
+		}
+		// Validate mutually exclusive UDN flags
+		if udnl2 && udnl3 {
+			log.Fatal("flags --udnl2 and --udnl3 are mutually exclusive; please set only one")
+		}
+		if cudn != "" && (udnl2 || udnl3) {
+			log.Fatal("flags --cudn and --udnl2/--udnl3 are mutually exclusive; please set only one")
+		}
+		if ibWriteBwEnabled && (!privileged || !hostNetOnly) {
+			log.Fatalf("😭 ib_write_bw driver requires both --privileged and --hostNet flags")
+		}
+		if ibWriteBwEnabled && (udnl2 || udnl3 || cudn != "") {
+			log.Fatalf("😭 ib_write_bw driver cannot be used with UDN flags (--udnl2, --udnl3, --cudn)")
+		}
+		if ibWriteBwEnabled && vm {
+			log.Fatalf("😭 ib_write_bw driver cannot be used with --vm flag")
+		}
+		if ibWriteBwEnabled && bridge != "" {
+			log.Fatalf("😭 ib_write_bw driver cannot be used with --bridge flag")
+		}
+		if sriov != "" && bridge != "" {
+			log.Fatalf("😭 --sriov and --bridge are mutually exclusive")
+		}
+		if sriov != "" && ibWriteBwEnabled {
+			log.Fatalf("😭 --sriov and --ib-write-bw are mutually exclusive")
+		}
+		if sriov != "" && (udnl2 || udnl3 || cudn != "") {
+			log.Fatalf("😭 --sriov cannot be used with UDN flags (--udnl2, --udnl3, --cudn)")
+		}
+		if sriov != "" && hostNetOnly {
+			log.Fatalf("😭 --sriov cannot be used with --hostNet")
+		}
+		if sriov != "" && vm && pod {
+			log.Fatalf("😭 --sriov with --vm requires --pod=false. Pod SR-IOV uses deviceType netdevice while VM SR-IOV uses vfio-pci — they cannot share the same VFs.")
+		}
+		if macvlan != "" && bridge != "" {
+			log.Fatalf("😭 --macvlan and --bridge are mutually exclusive")
+		}
+		if macvlan != "" && sriov != "" {
+			log.Fatalf("😭 --macvlan and --sriov are mutually exclusive")
+		}
+		if macvlan != "" && ibWriteBwEnabled {
+			log.Fatalf("😭 --macvlan and --ib-write-bw are mutually exclusive")
+		}
+		if macvlan != "" && (udnl2 || udnl3 || cudn != "") {
+			log.Fatalf("😭 --macvlan cannot be used with UDN flags (--udnl2, --udnl3, --cudn)")
+		}
+		if macvlan != "" && hostNetOnly {
+			log.Fatalf("😭 --macvlan cannot be used with --hostNet")
+		}
+		if macvlan != "" && vm {
+			log.Fatalf("😭 --macvlan cannot be used with --vm")
+		}
+		if localnet != "" && !vm {
+			log.Fatalf("😭 --localnet requires --vm")
+		}
+		if localnet != "" && pod {
+			log.Fatalf("😭 --localnet requires --pod=false")
+		}
+		if localnet != "" && bridge != "" {
+			log.Fatalf("😭 --localnet and --bridge are mutually exclusive")
+		}
+		if localnet != "" && sriov != "" {
+			log.Fatalf("😭 --localnet and --sriov are mutually exclusive")
+		}
+		if localnet != "" && macvlan != "" {
+			log.Fatalf("😭 --localnet and --macvlan are mutually exclusive")
+		}
+		if localnet != "" && ibWriteBwEnabled {
+			log.Fatalf("😭 --localnet and --ib-write-bw are mutually exclusive")
+		}
+		if localnet != "" && cudn != "" {
+			log.Fatalf("😭 --localnet and --cudn are mutually exclusive")
+		}
+		if localnet != "" && (udnl2 || udnl3) {
+			log.Fatalf("😭 --localnet cannot be used with UDN flags (--udnl2, --udnl3)")
+		}
+		if localnet != "" && hostNetOnly {
+			log.Fatalf("😭 --localnet cannot be used with --hostNet")
+		}
+
+		// If a specific driver is explicitly requested, disable the default netperf driver
+		if (iperf3 || uperf || ibWriteBwEnabled) && !cmd.Flags().Changed("netperf") {
+			netperf = false
+		}
+		uid := ""
+		if id != "" {
+			uid = id
+		} else {
+			u := uuid.New()
+			uid = u.String()
+		}
+
+		if json {
+			log.SetError()
+		}
+
+		if debug {
+			log.SetDebug()
+		}
+
+		searchIndexName := index
+		if searchIndex != "" {
+			searchIndexName = searchIndex
+		}
+		var esClient *indexers.Indexer
+		if searchURL != "" {
+			var err error
+			esClient, err = archive.Connect(searchURL, searchIndexName, true)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		cfg, err := config.ParseConf(cfgfile)
+		if err != nil {
+			cf, err := config.ParseV2Conf(cfgfile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			cfg = cf
+		}
+		// Read in k8s config
+		kconfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			&clientcmd.ConfigOverrides{})
+		rconfig, err := kconfig.ClientConfig()
+		if err != nil {
+			log.Fatal(err)
+		}
+		client, err := kubernetes.NewForConfig(rconfig)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var metadataAgent *ocpmetadata.Metadata
+		clusterInfo := ocpmetadata.ClusterInfo{}
+		clusterInfoDegraded := false
+		if meta, err := ocpmetadata.NewMetadata(rconfig); err == nil {
+			metadataAgent = &meta
+			info, infoErr := metadataAgent.GetClusterInfo()
+			clusterInfo = info
+			if infoErr != nil {
+				clusterInfoDegraded = true
+				log.Warnf("Cluster info discovery degraded: %v", infoErr)
+			}
+		} else {
+			log.Warnf("Cluster metadata client unavailable: %v", err)
+		}
+		if clean {
+			cleanup(client, rconfig)
+		}
+		s := config.PerfScenarios{
+			HostNetwork:     full || hostNetOnly,
+			HostNetworkOnly: hostNetOnly,
+			NodeLocal:       nl,
+			AcrossAZ:        acrossAZ,
+			RestConfig:      *rconfig,
+			Configs:         cfg,
+			ClientSet:       client,
+			BridgeNetwork:   bridge,
+			BridgeNamespace: bridgeNamespace,
+			SriovNetwork:    sriov,
+			MacvlanNetwork:  macvlan,
+			LocalnetNetwork: localnet,
+			Cudn:            cudn != "",
+			IbWriteBwParams: ibWriteBw,
+			Sockets:         sockets,
+			Cores:           cores,
+			Threads:         threads,
+			Privileged:      privileged,
+		}
+		if serverIPAddr != "" {
+			s.ExternalServer = true
+		}
+		// Get node count
+		nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker="})
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !s.NodeLocal && len(nodes.Items) < 2 {
+			log.Error("Node count too low to run pod to pod across nodes.")
+			log.Error("To run k8s-netperf on a single node deployment pass -local.")
+			log.Error("	$ k8s-netperf --local")
+			os.Exit(1)
+		}
+
+		pavail := true
+		var pcon metrics.PromConnect
+		if shouldDiscoverPrometheus(clusterInfo.Metadata.Distribution, promURL, metadataAgent != nil, clusterInfoDegraded) {
+			pcon, _ = metrics.Discover(metadataAgent)
+		}
+		if promURL != "" {
+			pcon.URL = promURL
+		}
+		applyClusterDistribution(&pcon, clusterInfo.Metadata.Distribution)
+		if pcon.URL == "" {
+			pavail = false
+			log.Warn("😥 Prometheus is not available")
+		} else {
+			pcon.Client, err = prometheus.NewClient(pcon.URL, pcon.Token, "", "", pcon.SkipTLSVerify)
+			if err != nil {
+				pavail = false
+				log.Warn("😥 Prometheus is not available")
+			}
+		}
+
+		// Build the namespace and create the sa account
+		err = k8s.BuildInfra(client, udnl2 || udnl3)
+		if err != nil {
+			log.Error(err)
+			os.Exit(1)
+		}
+
+		if udnl2 || udnl3 {
+			s.Udn = true
+			// Create a dynamic client
+			dynClient, err := dynamic.NewForConfig(rconfig)
+			if err != nil {
+				log.Error(err)
+			}
+			s.DClient = dynClient
+			if udnl2 {
+				err = k8s.DeployL2Udn(dynClient)
+			} else if udnl3 {
+				err = k8s.DeployL3Udn(dynClient)
+			}
+			if err != nil {
+				log.Error(err)
+				os.Exit(1)
+			}
+		} else if cudn != "" {
+			s.Cudn = true
+			dynClient, err := dynamic.NewForConfig(rconfig)
+			if err != nil {
+				log.Error(err)
+			}
+			err = k8s.DeployCUDN(dynClient, cudn)
+			if err != nil {
+				log.Error(err)
+				os.Exit(1)
+			}
+		}
+
+		s.Pod = pod
+		if vm {
+			s.VM = true
+			s.VMImage = vmimage
+			s.UseVirtctl = useVirtctl
+			// Create a dynamic client
+			if s.DClient == nil {
+				dynClient, err := dynamic.NewForConfig(rconfig)
+				if err != nil {
+					log.Error(err)
+				}
+				s.DClient = dynClient
+			}
+			kclient, err := kubevirtv1.NewForConfig(rconfig)
+			if err != nil {
+				log.Error(err)
+			}
+			s.KClient = kclient
+			if bridge != "" {
+				err := k8s.DeployNADBridge(s.DClient, bridge)
+				if err != nil {
+					log.Error(err)
+				}
+				s.BridgeServerNetwork, s.BridgeClientNetwork, err = parseNetworkConfig(bridgeNetwork)
+				if err != nil {
+					log.Error(err)
+				}
+			}
+			if localnet != "" {
+				s.LocalnetServerNetwork, s.LocalnetClientNetwork, err = parseLocalnetNetworkConfig(localnetConfig)
+				if err != nil {
+					log.Fatalf("Failed to parse localnet config: %v", err)
+				}
+				log.Debugf("Localnet parsed: serverNetwork=%s, clientNetwork=%s", s.LocalnetServerNetwork, s.LocalnetClientNetwork)
+				if s.DClient == nil {
+					log.Fatal("Failed to create dynamic client for localnet CUDN deployment")
+				}
+				err = k8s.DeployLocalnetCUDN(s.DClient, localnet)
+				if err != nil {
+					log.Error(err)
+					os.Exit(1)
+				}
+			}
+			if s.Udn {
+				s.UdnPluginBinding = udnPluginBinding
+			}
+		}
+
+		// Validate bridge network configuration before creating pods
+		if bridge != "" && !vm {
+			// Create dynamic client for validation if not already created
+			var dynClient dynamic.Interface
+			if s.DClient != nil {
+				dynClient = s.DClient
+			} else {
+				dynClient, err = dynamic.NewForConfig(rconfig)
+				if err != nil {
+					log.Fatalf("Failed to create dynamic client for bridge validation: %v", err)
+				}
+			}
+
+			err = k8s.ValidateBridgeNetwork(client, dynClient, bridge, bridgeNamespace)
+			if err != nil {
+				log.Fatalf("Bridge network validation failed: %v", err)
+			}
+		}
+
+		// Deploy SR-IOV resources if requested
+		if sriov != "" {
+			if s.DClient == nil {
+				dynClient, err := dynamic.NewForConfig(rconfig)
+				if err != nil {
+					log.Fatalf("Failed to create dynamic client for SR-IOV: %v", err)
+				}
+				s.DClient = dynClient
+			}
+			err = k8s.DeploySriovOperatorConfig(s.DClient, sriovNodeSelector)
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = k8s.DeploySriovPolicy(s.DClient, sriov, sriovNodeSelector, vm)
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = k8s.DeploySriovNetwork(s.DClient, sriov)
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = k8s.WaitForSriovNad(s.DClient)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		// Deploy MACVLAN NAD if requested
+		if macvlan != "" {
+			if s.DClient == nil {
+				dynClient, err := dynamic.NewForConfig(rconfig)
+				if err != nil {
+					log.Fatalf("Failed to create dynamic client for MACVLAN: %v", err)
+				}
+				s.DClient = dynClient
+			}
+			err = k8s.DeployNADMacvlan(s.DClient, macvlan)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		// Determine requested drivers BEFORE building SUT
+		var requestedDrivers []string
+		if netperf {
+			requestedDrivers = append(requestedDrivers, "netperf")
+		}
+		if uperf {
+			requestedDrivers = append(requestedDrivers, "uperf")
+		}
+		if iperf3 {
+			requestedDrivers = append(requestedDrivers, "iperf3")
+		}
+		if ibWriteBwEnabled {
+			requestedDrivers = append(requestedDrivers, "ib_write_bw")
+		}
+
+		// Set requested drivers BEFORE BuildSUT
+		s.RequestedDrivers = requestedDrivers
+
+		// Debug: Print requested drivers
+		log.Debugf("🔥 Requested drivers: %v", requestedDrivers)
+		log.Debugf("🔥 netperf=%v, iperf3=%v, uperf=%v, ibWriteBw=%v", netperf, iperf3, uperf, ibWriteBwEnabled)
+
+		// Build the SUT (Deployments)
+		err = k8s.BuildSUT(client, &s)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		sr.Version = cmdVersion.Version
+		sr.GitCommit = cmdVersion.GitCommit
+		// If the client and server needs to be across zones
+		lz, zones, err := k8s.GetZone(client)
+		if s.NodeLocal || err != nil || len(zones) == 0 {
+			acrossAZ = false
+		} else {
+			nodesInZone := zones[lz]
+			acrossAZ = nodesInZone <= 1
+		}
+		time.Sleep(5 * time.Second) // Wait some seconds to ensure service is ready
+
+		// Run pod tests if enabled
+		if s.Pod {
+			for _, nc := range s.Configs {
+				// Determine the metric for the test
+				metric := string("OP/s")
+				if strings.Contains(nc.Profile, "STREAM") {
+					metric = "Mb/s"
+				}
+				nc.Metric = metric
+				nc.AcrossAZ = acrossAZ
+				// No need to run hostNetwork through Service.
+				for _, driver := range requestedDrivers {
+					if s.HostNetwork && !nc.Service {
+						pr, ok := executeWorkload(nc, s, true, driver, false)
+						if ok {
+							sr.Results = append(sr.Results, pr)
+						}
+					}
+					// Skip podNetwork tests if hostNetOnly is enabled
+					if !hostNetOnly {
+						pr, ok := executeWorkload(nc, s, false, driver, false)
+						if ok {
+							sr.Results = append(sr.Results, pr)
+						}
+					}
+				}
+			}
+		}
+
+		// Run VM tests if enabled
+		if s.VM {
+			sr.Virt = true
+			if s.UseVirtctl {
+				log.Info("Connecting to VMI using virtctl")
+			} else {
+				log.Info("Connecting via ssh to the VMI")
+			}
+
+			// Use the new unified connection method
+			vmClient, err := k8s.ConnectToVM(&s)
+			if err != nil {
+				log.Fatal(err)
+			}
+			s.VMClientExecutor = vmClient
+
+			for _, nc := range s.Configs {
+				// Determine the metric for the test
+				metric := string("OP/s")
+				if strings.Contains(nc.Profile, "STREAM") {
+					metric = "Mb/s"
+				}
+				nc.Metric = metric
+				nc.AcrossAZ = acrossAZ
+				// No need to run hostNetwork through Service.
+				for _, driver := range requestedDrivers {
+					if s.HostNetwork && !nc.Service {
+						log.Info("VM does not support hostNetwork option... skiping")
+					}
+					// Skip podNetwork tests if hostNetOnly is enabled
+					if !hostNetOnly {
+						pr, ok := executeWorkload(nc, s, false, driver, true)
+						if ok {
+							sr.Results = append(sr.Results, pr)
+						}
+					}
+				}
+			}
+		}
+
+		if pavail {
+			for i, npr := range sr.Results {
+				if len(npr.ClientNodeInfo.NodeName) > 0 && len(npr.ServerNodeInfo.NodeName) > 0 {
+					clientCPU, err := metrics.QueryNodeCPU(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime)
+					if err != nil {
+						log.Warnf("Client node CPU metrics were not collected; archiving zero clientCPU with clientCPUCollected=false: node=%s profile=%s messageSize=%d parallelism=%d service=%t sameNode=%t: %v", npr.ClientNodeInfo.NodeName, npr.Profile, npr.MessageSize, npr.Parallelism, npr.Service, npr.SameNode, err)
+					} else {
+						sr.Results[i].ClientMetrics = clientCPU
+						sr.Results[i].ClientCPUCollected = true
+					}
+					serverCPU, err := metrics.QueryNodeCPU(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime)
+					if err != nil {
+						log.Warnf("Server node CPU metrics were not collected; archiving zero serverCPU with serverCPUCollected=false: node=%s profile=%s messageSize=%d parallelism=%d service=%t sameNode=%t: %v", npr.ServerNodeInfo.NodeName, npr.Profile, npr.MessageSize, npr.Parallelism, npr.Service, npr.SameNode, err)
+					} else {
+						sr.Results[i].ServerMetrics = serverCPU
+						sr.Results[i].ServerCPUCollected = true
+					}
+					metrics.VSwitchCPU(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime, &sr.Results[i].ClientMetrics)
+					metrics.VSwitchMem(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime, &sr.Results[i].ClientMetrics)
+					metrics.VSwitchCPU(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime, &sr.Results[i].ServerMetrics)
+					metrics.VSwitchMem(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime, &sr.Results[i].ServerMetrics)
+					sr.Results[i].ClientPodCPU, _ = metrics.TopPodCPU(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime)
+					sr.Results[i].ServerPodCPU, _ = metrics.TopPodCPU(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime)
+					sr.Results[i].ClientPodMem, _ = metrics.TopPodMem(npr.ClientNodeInfo, pcon, npr.StartTime, npr.EndTime)
+					sr.Results[i].ServerPodMem, _ = metrics.TopPodMem(npr.ServerNodeInfo, pcon, npr.StartTime, npr.EndTime)
+				}
+			}
+		}
+
+		sr.ClusterMetadata = clusterInfo.Metadata
+
+		shortReg, _ := regexp.Compile(`([0-9]\.[0-9]+)-*`)
+		short := shortReg.FindString(sr.OCPVersion)
+		sr.OCPShortVersion = short
+
+		if pavail {
+			node := metrics.NodeDetails(pcon)
+			sr.Kernel = node.Metric.Kernel
+			mtu, err := metrics.NodeMTU(pcon)
+			if err == nil {
+				sr.MTU = mtu
+			}
+		}
+
+		if !json {
+			result.ShowStreamResult(sr)
+			result.ShowRRResult(sr)
+			result.ShowLatencyResult(sr)
+			result.ShowSpecificResults(sr)
+			if showMetrics {
+				result.ShowNodeCPU(sr)
+				result.ShowPodCPU(sr)
+				result.ShowPodMem(sr)
+			}
+		} else {
+			err = archive.WriteJSONResult(sr)
+			if err != nil {
+				log.Error(err)
+			}
+		}
+		if csvArchive {
+			if err := archive.WriteCSVResult(sr); err != nil {
+				log.Fatal(err)
+			}
+			if pavail {
+				if err := archive.WritePromCSVResult(sr); err != nil {
+					log.Fatal(err)
+				}
+			}
+			if err := archive.WriteSpecificCSV(sr); err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if searchURL != "" {
+			jdocs, err := archive.BuildDocs(sr, uid)
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Infof("Indexing [%d] documents in %s with UUID %s", len(jdocs), searchIndexName, uid)
+			resp, err := (*esClient).Index(jdocs, indexers.IndexingOpts{})
+			if err != nil {
+				log.Error(err.Error())
+			} else {
+				log.Info(resp)
+			}
+		}
+		// Initially we are just checking against TCP_STREAM results.
+		retCode := 0
+		if !hostNetOnly && result.CheckHostResults(sr) {
+			diffs, err := result.TCPThroughputDiff(&sr)
+			if err != nil {
+				log.Error("Unable to calculate difference between HostNetwork and PodNetwork")
+				retCode = 1
+			} else {
+				for _, diff := range diffs {
+					if tcpt < diff.Result {
+						log.Errorf("😥 TCP Single Stream (Message Size : %d) percent difference when comparing hostNetwork to podNetwork is greater than %.1f percent (%.1f percent) for %d streams", diff.MessageSize, tcpt, diff.Result, diff.Streams)
+						retCode = 1
+					}
+				}
+			}
+		}
+		if clean {
+			cleanup(client, rconfig)
+		}
+		// Cleanup extracted virtctl binary if any
+		if err := virtctl.CleanupExtractedBinary(); err != nil {
+			log.Debugf("Failed to cleanup extracted virtctl binary: %v", err)
+		}
+		os.Exit(retCode)
+	},
+}
+
+func applyClusterDistribution(pcon *metrics.PromConnect, distribution string) {
+	switch distribution {
+	case ocpmetadata.DistributionOpenShift:
+		pcon.OpenShift = true
+	case ocpmetadata.DistributionMicroShift:
+		pcon.MicroShift = true
+	}
+}
+
+func shouldDiscoverPrometheus(distribution, promURL string, metadataAgentAvailable, clusterInfoDegraded bool) bool {
+	if !metadataAgentAvailable {
+		return false
+	}
+	if clusterInfoDegraded {
+		return true
+	}
+	switch distribution {
+	case ocpmetadata.DistributionOpenShift:
+		// OpenShift --prom often points at a port-forwarded monitoring service
+		// and still benefits from discovery for the auth token.
+		return true
+	case ocpmetadata.DistributionMicroShift, ocpmetadata.DistributionKubernetes:
+		return false
+	default:
+		return promURL == ""
+	}
+}
+
+func cleanup(client *kubernetes.Clientset, rconfig *rest.Config) {
+	if cudn != "" {
+		dynClient, err := dynamic.NewForConfig(rconfig)
+		if err != nil {
+			log.Error(err)
+		}
+		err = k8s.DestroyCUdn(dynClient, k8s.CudnName)
+		if err != nil {
+			log.Error(err)
+		}
+	}
+	if sriov != "" {
+		dynClient, err := dynamic.NewForConfig(rconfig)
+		if err != nil {
+			log.Error(err)
+		}
+		err = k8s.DestroySriovResources(dynClient)
+		if err != nil {
+			log.Error(err)
+		}
+	}
+	if localnet != "" {
+		dynClient, err := dynamic.NewForConfig(rconfig)
+		if err != nil {
+			log.Errorf("Skipping localnet CUDN cleanup: failed to create dynamic client: %v", err)
+		} else {
+			err = k8s.DestroyCUdn(dynClient, k8s.LocalnetCudnName)
+			if err != nil {
+				log.Error(err)
+			}
+		}
+	}
+	err := k8s.DestroyNamespace(client)
+	if err != nil {
+		log.Error(err)
 		os.Exit(1)
+	}
+}
+
+// Function to parse the JSON from a file and return the IP parts (before '/')
+func parseNetworkConfig(jsonFile string) (string, string, error) {
+
+	// Open the JSON file
+	file, err := os.Open(jsonFile)
+	if err != nil {
+		return "", "", fmt.Errorf("error opening file: %v", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Warnf("Error closing file: %v", err)
+		}
+	}()
+
+	// Read the file contents
+	log.Debugf("Reading BridgeNetwork configuration from JSON file: %s ", jsonFile)
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return "", "", fmt.Errorf("error reading file: %v", err)
+	}
+
+	// Create an instance of the struct
+	var netConfig config.BridgeNetworkConfig
+
+	// Unmarshal the JSON string into the struct
+	err = encodeJson.Unmarshal(content, &netConfig)
+	if err != nil {
+		return "", "", fmt.Errorf("error parsing JSON: %v", err)
+	}
+
+	// Extract the IP parts (before '/')
+	serverIP := netConfig.BridgeServerNetwork
+	clientIP := netConfig.BridgeClientNetwork
+
+	// Return the extracted IPs
+	return serverIP, clientIP, nil
+}
+
+func parseLocalnetNetworkConfig(jsonFile string) (string, string, error) {
+	file, err := os.Open(jsonFile)
+	if err != nil {
+		return "", "", fmt.Errorf("error opening file: %v", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Warnf("Error closing file: %v", err)
+		}
+	}()
+
+	log.Debugf("Reading localnet configuration from JSON file: %s", jsonFile)
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return "", "", fmt.Errorf("error reading file: %v", err)
+	}
+
+	var netConfig config.LocalnetNetworkConfig
+	err = encodeJson.Unmarshal(content, &netConfig)
+	if err != nil {
+		return "", "", fmt.Errorf("error parsing JSON: %v", err)
+	}
+	if err := validateCIDR(netConfig.LocalnetServerNetwork, "localnetServerNetwork"); err != nil {
+		return "", "", err
+	}
+	if err := validateCIDR(netConfig.LocalnetClientNetwork, "localnetClientNetwork"); err != nil {
+		return "", "", err
+	}
+
+	return netConfig.LocalnetServerNetwork, netConfig.LocalnetClientNetwork, nil
+}
+
+func validateCIDR(value, field string) error {
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	if _, _, err := net.ParseCIDR(value); err != nil {
+		return fmt.Errorf("%s must be a valid CIDR (got %q): %w", field, value, err)
+	}
+	return nil
+}
+
+// executeWorkload runs the workload and returns (result.Data, bool).
+// The bool is true when the result should be recorded and false when
+// the selected driver does not support the configured profile.
+func executeWorkload(nc config.Config,
+	s config.PerfScenarios,
+	hostNet bool,
+	driverName string, virt bool) (result.Data, bool) {
+	serverIP := ""
+	var err error
+	Client := s.Client
+	var driver drivers.Driver
+	npr := result.Data{}
+	npr.Virt = virt
+	if serverIPAddr != "" {
+		serverIP = serverIPAddr
+		npr.ExternalServer = true
+	} else if s.LocalnetNetwork != "" {
+		// Prefer localnet over Service so service-enabled configs still exercise the localnet interface.
+		if s.LocalnetServerNetwork == "" {
+			log.Fatal("localnet server network not configured: ensure localnetNetwork.json is valid when using --localnet")
+		}
+		serverIP = strings.Split(s.LocalnetServerNetwork, "/")[0]
+		log.Debugf("Using localnet network IP: %s", serverIP)
+		npr.LocalnetInfo = fmt.Sprintf("localnet/%s", s.LocalnetNetwork)
+	} else if nc.Service {
+		switch driverName {
+		case "iperf3":
+			if virt {
+				serverIP = s.IperfVmService.Spec.ClusterIP
+			} else {
+				serverIP = s.IperfService.Spec.ClusterIP
+			}
+		case "uperf":
+			if virt {
+				serverIP = s.UperfVmService.Spec.ClusterIP
+			} else {
+				serverIP = s.UperfService.Spec.ClusterIP
+			}
+		default:
+			if virt {
+				serverIP = s.NetperfVmService.Spec.ClusterIP
+			} else {
+				serverIP = s.NetperfService.Spec.ClusterIP
+			}
+		}
+	} else if s.Udn {
+		serverIP, err = k8s.ExtractUdnIp(s.Server.Items[0], k8s.UdnName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// collect UDN info
+		if udnl2 {
+			npr.UdnInfo = "layer2"
+		} else if udnl3 {
+			npr.UdnInfo = "layer3"
+		}
+		if s.VM {
+			npr.UdnInfo = npr.UdnInfo + " - " + s.UdnPluginBinding
+		}
+	} else if s.Cudn {
+		serverIP, err = k8s.ExtractUdnIp(s.Server.Items[0], k8s.CudnName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		npr.UdnInfo = "Cudn -" + cudn
+	} else if s.SriovNetwork != "" {
+		if virt {
+			serverIP, err = k8s.ExtractSriovIp(s.VMServer.Items[0])
+		} else {
+			serverIP, err = k8s.ExtractSriovIp(s.Server.Items[0])
+		}
+		if err != nil {
+			log.Fatalf("Failed to extract SR-IOV IP: %v", err)
+		}
+		log.Debugf("Using SR-IOV network IP: %s", serverIP)
+		npr.SriovInfo = fmt.Sprintf("sriov/%s", s.SriovNetwork)
+	} else if s.BridgeNetwork != "" {
+		if virt {
+			// VMs use static bridge IPs from bridgeNetwork.json (loaded via parseNetworkConfig when --vm --bridge)
+			if s.BridgeServerNetwork == "" {
+				log.Fatal("bridge server network not configured: ensure bridgeNetwork.json is valid when using --vm --bridge")
+			}
+			serverIP = strings.Split(s.BridgeServerNetwork, "/")[0]
+			npr.BridgeInfo = fmt.Sprintf("VM Bridge (%s)", serverIP)
+		} else {
+			serverIP, err = k8s.ExtractBridgeIp(s.Server.Items[0], s.BridgeNetwork, s.BridgeNamespace)
+			if err != nil {
+				log.Fatalf("Failed to extract bridge IP: %v", err)
+			}
+			npr.BridgeInfo = fmt.Sprintf("%s/%s", s.BridgeNamespace, s.BridgeNetwork)
+		}
+		log.Debugf("Using bridge network IP: %s", serverIP)
+	} else if s.MacvlanNetwork != "" {
+		serverIP, err = k8s.ExtractMacvlanIp(s.Server.Items[0])
+		if err != nil {
+			log.Fatalf("Failed to extract MACVLAN IP: %v", err)
+		}
+		log.Debugf("Using MACVLAN network IP: %s", serverIP)
+		npr.MacvlanInfo = fmt.Sprintf("macvlan/%s", s.MacvlanNetwork)
+	} else {
+		if virt {
+			serverIP = s.VMServer.Items[0].Status.PodIP
+		} else {
+			if hostNet && !s.NodeLocal {
+				serverIP = s.ServerHost.Items[0].Status.PodIP
+			} else {
+				serverIP = s.Server.Items[0].Status.PodIP
+			}
+		}
+	}
+	if !s.NodeLocal && !s.ExternalServer {
+		if virt {
+			Client = s.VMClientAcross
+		} else {
+			Client = s.ClientAcross
+		}
+	}
+	if hostNet && !s.NodeLocal {
+		Client = s.ClientHost
+	}
+	npr.Config = nc
+	npr.Metric = nc.Metric
+	npr.Service = nc.Service
+	npr.SameNode = s.NodeLocal
+	npr.HostNetwork = hostNet
+	npr.Virt = virt
+	if s.AcrossAZ {
+		npr.AcrossAZ = true
+	} else {
+		npr.AcrossAZ = nc.AcrossAZ
+	}
+	if npr.SameNode {
+		npr.AcrossAZ = false
+	}
+	npr.StartTime = time.Now()
+	log.Debugf("Executing workloads. hostNetwork is %t, service is %t, externalServer is %t, VM mode is %t", hostNet, nc.Service, npr.ExternalServer, virt)
+	driver, err = drivers.NewDriver(driverName, nc)
+	if err != nil {
+		log.Fatal(err)
+	}
+	npr.Driver = driverName
+	// Check if test is supported
+	if !driver.IsTestSupported() {
+		log.Warnf("Test %s is not supported with driver %s. Skipping.", nc.Profile, npr.Driver)
+		return npr, false
+	}
+	for i := 0; i < nc.Samples; i++ {
+		nr := sample.Sample{}
+		r, err := driver.Run(s.ClientSet, s.RestConfig, nc, Client, serverIP, &s, virt)
+		if err != nil {
+			log.Fatal(err)
+		}
+		nr, err = driver.ParseResults(&r, nc)
+		if err != nil {
+			log.Error(err)
+			try := 0
+			success := false
+			// Retry the current test.
+			for try < retry {
+				log.Warn("Rerunning test.")
+				r, err := driver.Run(s.ClientSet, s.RestConfig, nc, Client, serverIP, &s, virt)
+				if err != nil {
+					log.Error(err)
+					continue
+				}
+				nr, err = driver.ParseResults(&r, nc)
+				if err != nil {
+					log.Error(err)
+					try++
+				} else {
+					success = true
+					break
+				}
+			}
+			if !success {
+				log.Fatal("test was unsuccessful after retry.")
+			}
+		}
+		npr.LossSummary = append(npr.LossSummary, float64(nr.LossPercent))
+		npr.RetransmitSummary = append(npr.RetransmitSummary, nr.Retransmits)
+		npr.ThroughputSummary = append(npr.ThroughputSummary, nr.Throughput)
+		npr.LatencyAvgSummary = append(npr.LatencyAvgSummary, nr.Latency)
+		npr.Latency50Summary = append(npr.Latency50Summary, nr.Latency50ptile)
+		npr.LatencySummary = append(npr.LatencySummary, nr.Latency99ptile)
+	}
+	npr.EndTime = time.Now()
+	npr.ClientNodeInfo = s.ClientNodeInfo
+	npr.ServerNodeInfo = s.ServerNodeInfo
+
+	return npr, true
+}
+
+func main() {
+	rootCmd.Flags().StringVar(&cfgfile, "config", "netperf.yml", "K8s netperf Configuration File")
+	rootCmd.Flags().BoolVar(&netperf, "netperf", true, "Use netperf as load driver (default true)")
+	rootCmd.Flags().BoolVar(&iperf3, "iperf", false, "Use iperf3 as load driver (default false)")
+	rootCmd.Flags().BoolVar(&uperf, "uperf", false, "Use uperf as load driver (default false)")
+	rootCmd.Flags().StringVar(&ibWriteBw, "ib-write-bw", "", "Use ib_write_bw as load driver, requires nic:gid format (e.g., mlx5_0:0, requires --hostNet)")
+	rootCmd.Flags().BoolVar(&clean, "clean", true, "Clean-up resources created by k8s-netperf (default true)")
+	rootCmd.Flags().BoolVar(&json, "json", false, "Instead of human-readable output, return JSON to stdout and archive it to a file (default false)")
+	rootCmd.Flags().BoolVar(&nl, "local", false, "Run network performance tests with Server-Pods/Client-Pods on the same Node (default false)")
+	rootCmd.Flags().BoolVar(&pod, "pod", true, "Run tests using pods (default true)")
+	rootCmd.Flags().BoolVar(&vm, "vm", false, "Run tests using Virtual Machines (default false)")
+	rootCmd.Flags().StringVar(&vmimage, "vm-image", "quay.io/containerdisks/fedora:39", "Use specified VM image (default quay.io/containerdisks/fedora:39)")
+	rootCmd.Flags().BoolVar(&useVirtctl, "use-virtctl", false, "Use virtctl ssh for VM connections instead of traditional SSH (default false)")
+	rootCmd.Flags().Uint32Var(&sockets, "sockets", 2, "Number of Sockets for VM (default 2)")
+	rootCmd.Flags().Uint32Var(&cores, "cores", 2, "Number of cores for VM (default 2)")
+	rootCmd.Flags().Uint32Var(&threads, "threads", 1, "Number of threads for VM (default 1)")
+	rootCmd.Flags().BoolVar(&acrossAZ, "across", false, "Place the client and server across availability zones (default false)")
+	rootCmd.Flags().BoolVar(&full, "all", false, "Run all tests scenarios - hostNet and podNetwork (if possible) (default false)")
+	rootCmd.Flags().BoolVar(&hostNetOnly, "hostNet", false, "Run only hostNetwork tests (no podNetwork tests) (default false)")
+	rootCmd.Flags().BoolVar(&debug, "debug", false, "Enable debug log (default false)")
+	rootCmd.Flags().BoolVar(&udnl2, "udnl2", false, "Create and use a layer2 UDN as a primary network (default false)")
+	rootCmd.Flags().BoolVar(&udnl3, "udnl3", false, "Create and use a layer3 UDN as a primary network (default false)")
+	rootCmd.Flags().StringVar(&cudn, "cudn", "", "Create and use a Cluster UDN that would be used as a secondary network")
+	rootCmd.MarkFlagsMutuallyExclusive("all", "hostNet")
+	rootCmd.Flags().StringVar(&udnPluginBinding, "udnPluginBinding", "passt", "UDN with VMs only - the binding method of the UDN interface, select 'passt' or 'l2bridge' (default passt)")
+	rootCmd.Flags().StringVar(&bridge, "bridge", "", "Name of the NetworkAttachmentDefinition to be used for bridge interface")
+	rootCmd.Flags().StringVar(&bridgeNamespace, "bridgeNamespace", "default", "Namespace of the NetworkAttachmentDefinition for bridge interface (default default)")
+	rootCmd.Flags().StringVar(&bridgeNetwork, "bridgeNetwork", "bridgeNetwork.json", "Json file for the VM network defined by the bridge interface - bridge should be enabled (default bridgeNetwork.json)")
+	rootCmd.Flags().StringVar(&sriov, "sriov", "", "SR-IOV PF interface name (e.g., ens1f0). Creates SriovNetworkNodePolicy and SriovNetwork CRs. Requires SR-IOV operator.")
+	rootCmd.Flags().StringVar(&sriovNodeSelector, "sriov-node-selector", "worker", "Node role label for SR-IOV node selector (default worker)")
+	rootCmd.Flags().StringVar(&macvlan, "macvlan", "", "MACVLAN master interface name (e.g., eth0). Creates a MACVLAN NetworkAttachmentDefinition.")
+	rootCmd.Flags().StringVar(&localnet, "localnet", "", "OVN localnet external network name (e.g., physnet). VM-only. Creates a Localnet CUDN. Requires --vm --pod=false and OVN-K bridge mapping.")
+	rootCmd.Flags().StringVar(&localnetConfig, "localnet-config", "localnetNetwork.json", "JSON file with static IPs for localnet server/client (default localnetNetwork.json)")
+	rootCmd.Flags().StringVar(&promURL, "prom", "", "Prometheus URL")
+	rootCmd.Flags().StringVar(&id, "uuid", "", "User provided UUID")
+	rootCmd.Flags().StringVar(&searchURL, "search", "", "OpenSearch URL, if you have auth, pass in the format of https://user:pass@url:port")
+	rootCmd.Flags().StringVar(&searchIndex, "index", "", "OpenSearch Index to save the results to (default k8s-netperf)")
+	rootCmd.Flags().BoolVar(&showMetrics, "metrics", false, "Show all system metrics retrieved from prom (default false)")
+	rootCmd.Flags().Float64Var(&tcpt, "tcp-tolerance", 10, "Allowed %diff from hostNetwork to podNetwork, anything above tolerance will result in k8s-netperf exiting 1 (default 10)")
+	rootCmd.Flags().BoolVar(&version, "version", false, "k8s-netperf version")
+	rootCmd.Flags().BoolVar(&csvArchive, "csv", true, "Archive results, cluster and benchmark metrics in CSV files (default true)")
+	rootCmd.Flags().StringVar(&serverIPAddr, "serverIP", "", "External Server IP Address")
+	rootCmd.Flags().BoolVar(&privileged, "privileged", false, "Run pods with privileged security context (default false)")
+	rootCmd.Flags().SortFlags = false
+	if err := rootCmd.Execute(); err != nil {
+		log.Fatal(err)
 	}
 }
